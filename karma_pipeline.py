@@ -1,13 +1,19 @@
 # karma_pipeline.py
 """
-KARMA: Leveraging Multi-Agent LLMs for Automated Knowledge Graph Enrichment
+KARMA: Knowledge Agent for Software Usage Documentation
 
 This module implements a pipeline of specialized agents that collaborate to:
-1. Extract knowledge from text sources
-2. Structure it into a knowledge graph
-3. Evaluate and integrate new knowledge
+1. Extract knowledge from software documentation (manuals, tutorials, release notes)
+2. Structure it into a versioned knowledge graph for software usage
+3. Track changes across software versions for easy maintenance
 
-Author: Yuxing Lu
+Designed to answer questions like:
+- "How do I remove the background in Photoshop 2024?"
+- "Where is the Export button located?"
+- "What changed in the latest update?"
+
+Original biomedical version by: Yuxing Lu
+Refactored for software usage by: KARMA Team
 """
 
 import os
@@ -16,6 +22,7 @@ import time
 import json
 from typing import List, Dict, Tuple, Union, Set, Optional
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 import PyPDF2
 from openai import OpenAI
 
@@ -27,394 +34,361 @@ logging.basicConfig(
 logger = logging.getLogger("KARMA")
 
 ##############################################################################
+# Enums for Type Safety
+##############################################################################
+
+class EntityType(str, Enum):
+    """Types of entities in a software usage knowledge graph."""
+    UI_ELEMENT = "UIElement"        # Buttons, menus, panels, tools, sliders, etc.
+    FEATURE = "Feature"             # Capabilities or functions
+    PROCEDURE = "Procedure"         # Multi-step workflows
+    STEP = "Step"                   # Individual step in a procedure
+    OUTCOME = "Outcome"             # Result of an action/procedure
+    CONCEPT = "Concept"             # Domain knowledge/terminology
+    SHORTCUT = "Shortcut"           # Keyboard/mouse shortcuts
+    SETTING = "Setting"             # Configuration options
+    FILE_FORMAT = "FileFormat"      # Supported file types
+    VERSION = "Version"             # Software version
+    CONSTRAINT = "Constraint"       # Limitations or requirements
+    SOFTWARE = "Software"           # The software product itself
+    UNKNOWN = "Unknown"
+
+class RelationType(str, Enum):
+    """Types of relationships in a software usage knowledge graph."""
+    # UI Navigation
+    LOCATED_IN = "located_in"               # UI hierarchy
+    ACCESSED_VIA = "accessed_via"           # How to reach something
+    CONTAINS = "contains"                   # Parent contains child
+
+    # Feature relationships
+    ACTIVATES = "activates"                 # UI element triggers feature
+    REQUIRES = "requires"                   # Dependency/prerequisite
+    ENABLES = "enables"                     # Makes something possible
+    ENHANCES = "enhances"                   # Improves another feature
+    CONFLICTS_WITH = "conflicts_with"       # Incompatible
+    ALTERNATIVE_TO = "alternative_to"       # Different way to same result
+
+    # Procedure relationships
+    PART_OF = "part_of"                     # Step belongs to procedure
+    NEXT_STEP = "next_step"                 # Step ordering
+    ACHIEVES = "achieves"                   # Produces outcome
+    PREREQUISITE_FOR = "prerequisite_for"   # Must do before
+
+    # Shortcuts and settings
+    SHORTCUT_FOR = "shortcut_for"           # Keyboard shortcut mapping
+    CONFIGURED_BY = "configured_by"         # Setting controls feature
+    DEFAULT_VALUE = "default_value"         # Default setting value
+
+    # File format
+    SUPPORTS = "supports"                   # File format compatibility
+    EXPORTS_TO = "exports_to"               # Can export as
+    IMPORTS_FROM = "imports_from"           # Can import from
+
+    # Version relationships
+    INTRODUCED_IN = "introduced_in"         # When first appeared
+    REMOVED_IN = "removed_in"               # When removed
+    CHANGED_IN = "changed_in"               # When modified
+    REPLACED_BY = "replaced_by"             # Successor
+    RENAMED_TO = "renamed_to"               # Name change
+    MOVED_TO = "moved_to"                   # Location change
+
+    # General
+    RELATED_TO = "related_to"               # General relationship
+
+class DocumentType(str, Enum):
+    """Types of documentation that can be processed."""
+    TUTORIAL = "tutorial"           # Step-by-step guides
+    REFERENCE = "reference"         # Feature/API reference
+    RELEASE_NOTES = "release_notes" # What's new/changelog
+    FAQ = "faq"                     # Frequently asked questions
+    TROUBLESHOOTING = "troubleshooting"  # Problem-solving guides
+    QUICK_START = "quick_start"     # Getting started guides
+    UNKNOWN = "unknown"
+
+class TripleStatus(str, Enum):
+    """Status of a knowledge triple."""
+    ACTIVE = "active"               # Currently valid
+    DEPRECATED = "deprecated"       # No longer valid
+    NEEDS_REVIEW = "needs_review"   # Flagged for verification
+    PENDING = "pending"             # Not yet verified
+
+##############################################################################
 # Data Structures
 ##############################################################################
 
 @dataclass
-class KnowledgeTriple:
+class SoftwareEntity:
     """
-    Data class representing a single knowledge triple in the biomedical domain.
-    
+    Represents an entity in the software usage knowledge graph.
+
     Attributes:
-        head: The subject entity
-        relation: The relationship type
-        tail: The object entity
-        confidence: Model confidence score [0-1]
-        source: Origin of the triple
-        relevance: Domain relevance score [0-1]
-        clarity: Linguistic clarity score [0-1]
+        entity_id: Unique identifier
+        name: Display name
+        entity_type: Type of entity (UIElement, Feature, etc.)
+        description: Optional description
+        parent_path: UI navigation path (e.g., "File > Export > Export As")
+        software: Which software this belongs to
+        version_introduced: Version when this entity first appeared
+        version_deprecated: Version when this entity was removed (None if active)
+        aliases: Alternative names for this entity
+    """
+    entity_id: str
+    name: str
+    entity_type: EntityType = EntityType.UNKNOWN
+    description: str = ""
+    parent_path: str = ""
+    software: str = ""
+    version_introduced: str = ""
+    version_deprecated: str = ""
+    aliases: List[str] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.entity_type.value})"
+
+    def __hash__(self):
+        return hash(self.entity_id)
+
+@dataclass
+class UsageKnowledgeTriple:
+    """
+    A versioned knowledge triple for software usage.
+
+    Captures relationships between software entities with full version
+    tracking to support maintenance and updates.
+
+    Attributes:
+        head: Subject entity name
+        relation: Relationship type
+        tail: Object entity name
+        head_type: Entity type of head
+        tail_type: Entity type of tail
+        introduced_version: First version where this is true
+        deprecated_version: Version where this became false (empty if still valid)
+        valid_version_range: Human-readable version range (e.g., "2020-2024" or "2023+")
+        confidence: Extraction confidence score [0-1]
+        source_document: Where this was extracted from
+        source_date: When source was published
+        step_order: Position in procedure (0 if not a step)
+        status: Current status (active, deprecated, needs_review)
+        software: Which software this applies to
     """
     head: str
     relation: str
     tail: str
+    head_type: EntityType = EntityType.UNKNOWN
+    tail_type: EntityType = EntityType.UNKNOWN
+    introduced_version: str = ""
+    deprecated_version: str = ""
+    valid_version_range: str = ""
     confidence: float = 0.0
-    source: str = "unknown"
-    relevance: float = 0.0
-    clarity: float = 0.0
-    
+    source_document: str = ""
+    source_date: str = ""
+    step_order: int = 0
+    status: TripleStatus = TripleStatus.ACTIVE
+    software: str = ""
+
     def __str__(self) -> str:
-        """String representation of the knowledge triple."""
-        return f"({self.head}) -[{self.relation}]-> ({self.tail})"
+        version_info = f" [{self.valid_version_range}]" if self.valid_version_range else ""
+        return f"({self.head}) -[{self.relation}]-> ({self.tail}){version_info}"
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "head": self.head,
+            "relation": self.relation,
+            "tail": self.tail,
+            "head_type": self.head_type.value if isinstance(self.head_type, EntityType) else self.head_type,
+            "tail_type": self.tail_type.value if isinstance(self.tail_type, EntityType) else self.tail_type,
+            "introduced_version": self.introduced_version,
+            "deprecated_version": self.deprecated_version,
+            "valid_version_range": self.valid_version_range,
+            "confidence": self.confidence,
+            "source_document": self.source_document,
+            "source_date": self.source_date,
+            "step_order": self.step_order,
+            "status": self.status.value if isinstance(self.status, TripleStatus) else self.status,
+            "software": self.software
+        }
 
 @dataclass
-class KGEntity:
+class Procedure:
     """
-    Data class representing a canonical entity in the knowledge graph.
-    
+    Represents a multi-step procedure/workflow.
+
     Attributes:
-        entity_id: Unique identifier
-        entity_type: Semantic type (e.g. Drug, Disease)
-        name: Display name
-        normalized_id: Reference to standard ontology (e.g., UMLS:C0004238)
+        procedure_id: Unique identifier
+        name: Name of the procedure
+        description: What this procedure accomplishes
+        steps: Ordered list of steps
+        prerequisites: What's needed before starting
+        outcome: Expected result
+        software: Which software this is for
+        version_range: Versions where this procedure is valid
     """
-    entity_id: str
-    entity_type: str = "Unknown"
-    name: str = ""
-    normalized_id: str = "N/A"
-    
+    procedure_id: str
+    name: str
+    description: str = ""
+    steps: List[str] = field(default_factory=list)
+    prerequisites: List[str] = field(default_factory=list)
+    outcome: str = ""
+    software: str = ""
+    version_range: str = ""
+
     def __str__(self) -> str:
-        """String representation of the entity."""
-        return f"{self.name} ({self.entity_type})"
+        return f"{self.name} ({len(self.steps)} steps)"
+
+@dataclass
+class ChangeRecord:
+    """
+    Records a change detected from release notes/updates.
+
+    Attributes:
+        change_type: Type of change (added, removed, changed, moved, renamed)
+        entity_name: What was changed
+        entity_type: Type of entity
+        old_value: Previous state (for changes/moves/renames)
+        new_value: New state
+        version: Version where change occurred
+        description: Details about the change
+    """
+    change_type: str  # "added", "removed", "changed", "moved", "renamed", "fixed"
+    entity_name: str
+    entity_type: EntityType = EntityType.UNKNOWN
+    old_value: str = ""
+    new_value: str = ""
+    version: str = ""
+    description: str = ""
 
 @dataclass
 class IntermediateOutput:
     """
-    Data class for storing intermediate outputs from each agent.
-    
-    Tracks the full pipeline state including raw inputs, 
-    intermediate results, and final outputs.
+    Stores intermediate outputs from each pipeline stage.
+
+    Tracks the full pipeline state for debugging and analysis.
     """
     raw_text: str = ""
+    document_type: DocumentType = DocumentType.UNKNOWN
+    detected_version: str = ""
+    detected_software: str = ""
     segments: List[Dict] = field(default_factory=list)
-    relevant_segments: List[Dict] = field(default_factory=list)
-    summaries: List[Dict] = field(default_factory=list)
-    entities: List[KGEntity] = field(default_factory=list)
-    relationships: List[KnowledgeTriple] = field(default_factory=list)
-    aligned_entities: List[KGEntity] = field(default_factory=list)
-    aligned_triples: List[KnowledgeTriple] = field(default_factory=list)
-    final_triples: List[KnowledgeTriple] = field(default_factory=list)
-    integrated_triples: List[KnowledgeTriple] = field(default_factory=list)
+    entities: List[SoftwareEntity] = field(default_factory=list)
+    procedures: List[Procedure] = field(default_factory=list)
+    triples: List[UsageKnowledgeTriple] = field(default_factory=list)
+    changes: List[ChangeRecord] = field(default_factory=list)
+    deprecated_triples: List[UsageKnowledgeTriple] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     processing_time: float = 0.0
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
-        result = {}
-        for key, value in asdict(self).items():
-            if isinstance(value, list) and value and hasattr(value[0], '__dict__'):
-                result[key] = [item.__dict__ for item in value]
-            else:
-                result[key] = value
-        return result
+        return {
+            "raw_text": self.raw_text[:1000] + "..." if len(self.raw_text) > 1000 else self.raw_text,
+            "document_type": self.document_type.value,
+            "detected_version": self.detected_version,
+            "detected_software": self.detected_software,
+            "segments": self.segments,
+            "entities": [asdict(e) for e in self.entities] if self.entities else [],
+            "procedures": [asdict(p) for p in self.procedures] if self.procedures else [],
+            "triples": [t.to_dict() for t in self.triples] if self.triples else [],
+            "changes": [asdict(c) for c in self.changes] if self.changes else [],
+            "deprecated_triples": [t.to_dict() for t in self.deprecated_triples] if self.deprecated_triples else [],
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "processing_time": self.processing_time
+        }
 
 ##############################################################################
-# Multi-Agent Classes
+# Agent Classes
 ##############################################################################
 
-class IngestionAgent:
+class DocumentClassifierAgent:
     """
-    Ingestion Agent (IA):
-    1) Retrieves and standardizes raw documents (PDF, text)
-    2) Extracts minimal metadata if available
+    Classifies incoming documents and extracts metadata.
+
+    Determines:
+    - Document type (tutorial, reference, release notes, etc.)
+    - Software name and version
+    - Publication date
+    - Relevance for knowledge extraction
     """
+
     def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Ingestion Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
         self.client = client
         self.model_name = model_name
-        self.system_prompt = """You are the Ingestion Agent (IA). Your responsibility is to:
-1. Retrieve raw publications from designated sources (e.g., PubMed, internal repositories).
-2. Convert various file formats (PDF, HTML, XML) into a consistent normalized text format.
-3. Extract metadata such as the title, authors, journal/conference name, publication date, and unique identifiers (DOI, PubMed ID).
+        self.system_prompt = """You are a Document Classification Agent for software documentation analysis.
 
-Key Requirements:
-- Handle OCR artifacts if the PDF is scanned (e.g., correct typical OCR errors where possible).
-- Normalize non-ASCII characters (Greek letters, special symbols) to ASCII or minimal LaTeX markup when relevant (e.g., \\alpha).
-- If certain fields cannot be extracted, leave them as empty or "N/A" but do not remove the key from the JSON.
+Your job is to analyze documents and determine:
+1. Document Type: What kind of documentation is this?
+   - tutorial: Step-by-step guides teaching how to do something
+   - reference: Feature documentation, API reference, settings descriptions
+   - release_notes: What's new, changelogs, update summaries
+   - faq: Frequently asked questions
+   - troubleshooting: Problem-solving guides
+   - quick_start: Getting started guides
+   - unknown: Cannot determine
 
-Error Handling:
-- In case of partial or unreadable text, mark the corrupted portions with placeholders (e.g., "[UNREADABLE]").
-- If the document is locked or inaccessible, set an error flag in the output JSON.
+2. Software Information:
+   - Software name (e.g., "Adobe Photoshop", "Figma", "Microsoft Excel")
+   - Version number if mentioned (e.g., "2024", "v25.0", "CC 2023")
+   - Publication/update date if available
+
+3. Content Assessment:
+   - Is this useful for building a "how to use" knowledge graph?
+   - What main topics/features does it cover?
 
 POSITIVE EXAMPLE:
-Input: A complex PDF with LaTeX symbols and tables about IL-6 inhibition in rheumatoid arthritis
+Input: "Photoshop 2024 User Guide - Chapter 5: Layers
+Learn how to work with layers in Photoshop. This guide covers creating, managing, and organizing layers...
+Step 1: To create a new layer, click the New Layer button in the Layers panel..."
+
 Output: {
-  "metadata": {
-    "title": "Effects of IL-6 Inhibition on Inflammatory Markers in Rheumatoid Arthritis",
-    "authors": ["Jane Smith", "Robert Johnson"],
-    "journal": "Journal of Immunology",
-    "pub_date": "2021-05-15",
-    "doi": "10.1234/jimmunol.2021.05.123",
-    "pmid": "33123456"
-  },
-  "content": "Introduction\\nInterleukin-6 (IL-6) is a key cytokine in the pathogenesis of rheumatoid arthritis (RA)...Methods\\nPatients (n=120) were randomized to receive either IL-6 inhibitor (n=60) or placebo (n=60)..."
+  "document_type": "tutorial",
+  "software": "Adobe Photoshop",
+  "version": "2024",
+  "date": "N/A",
+  "relevance_score": 0.95,
+  "main_topics": ["layers", "layer management", "layer creation"],
+  "rationale": "Step-by-step tutorial about using layers feature with clear instructions"
 }
 
 NEGATIVE EXAMPLE:
-Input: A complex PDF with LaTeX symbols and tables about IL-6 inhibition
+Input: "Company X Q3 Financial Report - Software Division showed 15% growth..."
+
 Bad Output: {
-  "title": "Effects of IL-6 Inhibition",
-  "text": "Interleukin-6 inhibition showed p<0.05 significance..."
+  "document_type": "reference",
+  "software": "Company X Software",
+  "version": "Q3"
 }
-This is incorrect because it doesn't use the expected metadata/content structure and omits required metadata fields.
+This is incorrect because it's a financial report, not software documentation. Should be marked as unknown with low relevance.
 """
 
-    def ingest_document(self, raw_text: str) -> Dict:
+    def classify_document(self, text: str) -> Tuple[Dict, int, int, float]:
         """
-        Standardize the raw text into a structured format with metadata.
-        
+        Classify a document and extract metadata.
+
         Args:
-            raw_text: Input text to process
-            
+            text: Document text to classify
+
         Returns:
-            Dict containing metadata and content
+            Tuple of (classification_dict, prompt_tokens, completion_tokens, processing_time)
         """
-        prompt = f"""
-        Please analyze this document and extract the following metadata if available:
-        - Title
-        - Authors
-        - Journal or source
-        - Publication date
-        - DOI or other identifiers
-        
-        If any field cannot be determined, mark it as "Unknown" or "N/A".
-        
-        Document:
-        {raw_text[:5000]}  # Truncate for efficiency
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
-            )
-            
-            extracted_text = response.choices[0].message.content
-            
-            # Extract metadata from the response
-            metadata = {
-                "title": "Unknown Title",
-                "authors": [],
-                "journal": "Unknown Journal", 
-                "pub_date": "N/A",
-                "doi": "N/A",
-                "pmid": "N/A"
-            }
-            
-            # Simple parsing of the LLM response
-            for line in extracted_text.split('\n'):
-                line = line.strip()
-                if line.startswith("Title:"):
-                    metadata["title"] = line[6:].strip()
-                elif line.startswith("Authors:"):
-                    authors_text = line[8:].strip()
-                    metadata["authors"] = [a.strip() for a in authors_text.split(',') if a.strip()]
-                elif line.startswith("Journal:"):
-                    metadata["journal"] = line[8:].strip()
-                elif line.startswith("Publication date:"):
-                    metadata["pub_date"] = line[17:].strip()
-                elif line.startswith("DOI:"):
-                    metadata["doi"] = line[4:].strip()
-                elif line.startswith("PMID:"):
-                    metadata["pmid"] = line[5:].strip()
-            
-            return {
-                "metadata": metadata,
-                "content": raw_text
-            }
-        except Exception as e:
-            logger.error(f"Ingestion failed: {str(e)}")
-            # Return a default structure on error
-            return {
-                "metadata": {
-                    "title": "Unknown Title",
-                    "authors": [],
-                    "journal": "Unknown Journal", 
-                    "pub_date": "N/A",
-                    "doi": "N/A",
-                    "pmid": "N/A",
-                    "error": str(e)
-                },
-                "content": raw_text
-            }
+        prompt = f"""Analyze this document and provide classification in JSON format:
 
-class ReaderAgent:
-    """
-    Reader Agent (RA):
-    1) Segments normalized text into logical chunks
-    2) Assigns a relevance score to each segment
-    """
-    def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Reader Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
-        self.client = client
-        self.model_name = model_name
-        self.system_prompt = """You are the Reader Agent (RA). Your goal is to parse the normalized text and generate logical segments (e.g., paragraph-level chunks) that are likely to contain relevant knowledge. Each segment must be accompanied by a numeric Relevance Score indicating its importance for downstream extraction tasks.
+Document (first 3000 chars):
+{text[:3000]}
 
-Scoring Heuristics:
-- Use domain knowledge (e.g., presence of known keywords, synonyms, or known entity patterns) to increase the score.
-- Use structural cues (e.g., headings like "Results", "Discussion" might have higher relevance for new discoveries).
-- If a segment is purely methodological (e.g., protocols or references to equipment) with no new knowledge, assign a lower score.
+Return a JSON object with these fields:
+- document_type: One of [tutorial, reference, release_notes, faq, troubleshooting, quick_start, unknown]
+- software: Name of the software product
+- version: Version number or "N/A" if not found
+- date: Publication date or "N/A" if not found
+- relevance_score: 0.0 to 1.0 for how useful this is for usage knowledge extraction
+- main_topics: List of main features/topics covered
+- rationale: Brief explanation of your classification
 
-Edge Cases:
-- Very short segments (<30 characters) or references sections might be assigned a minimal score.
-- If certain sections are incomplete or corrupted, still generate a segment but label it with "score": 0.0.
+Return only valid JSON, no other text."""
 
-POSITIVE EXAMPLE:
-Input: {
-  "metadata": {"title": "Antimicrobial Study"...},
-  "content": "Abstract\n We tested new...\n Methods\n The protocol was...\n Results\n The compound inhibited growth of S. aureus with MIC of 0.5 μg/mL\n"
-}
-Output: {
-  "segments": [
-    {"text": "Abstract We tested new...", "score": 0.85},
-    {"text": "Methods The protocol was...", "score": 0.30},
-    {"text": "Results The compound inhibited growth of S. aureus with MIC of 0.5 μg/mL", "score": 0.95}
-  ]
-}
-
-NEGATIVE EXAMPLE:
-Input: {
-  "metadata": {"title": "Antimicrobial Study"...},
-  "content": "Abstract\n We tested new...\n Methods\n The protocol was...\n Results\n The compound inhibited growth of S. aureus with MIC of 0.5 μg/mL\n"
-}
-Bad Output: {
-  "segments": [
-    {"text": "The entire paper discusses antimicrobial compounds", "score": 0.5}
-  ]
-}
-This is incorrect because it doesn't segment the text properly into logical chunks and doesn't assign differentiated relevance scores.
-"""
-    
-    def split_into_segments(self, content: str) -> List[Dict]:
-        """
-        Split content into logical segments.
-        
-        Args:
-            content: Text to segment
-            
-        Returns:
-            List of segment dictionaries with text and estimated score
-        """
-        # First do a basic split on paragraph breaks
-        raw_segments = content.split("\n\n")
-        segments = [{"text": seg.strip(), "score": 0.0} for seg in raw_segments if seg.strip()]
-        
-        # Process in batches to avoid context limitations
-        batch_size = 5
-        processed_segments = []
-        
-        for i in range(0, len(segments), batch_size):
-            batch = segments[i:i+batch_size]
-            batch_texts = [f"Segment {j+1}:\n{seg['text']}" for j, seg in enumerate(batch)]
-            
-            scores = self._batch_score_relevance(batch_texts)
-            
-            for j, seg in enumerate(batch):
-                if j < len(scores):
-                    seg["score"] = scores[j]
-                processed_segments.append(seg)
-        
-        return processed_segments
-
-    def _batch_score_relevance(self, segments: List[str]) -> List[float]:
-        """
-        Query the LLM for domain-specific relevance scores for multiple segments.
-        
-        Args:
-            segments: List of text segments to score
-            
-        Returns:
-            List of relevance scores
-        """
-        prompt = f"""
-        You are a biomedical text relevance scorer.
-        Rate how relevant each of the following segments is (0 to 1) for extracting
-        new biomedical knowledge (e.g., relationships between diseases, drugs, genes).
-        
-        Consider:
-        - Sections with experiments, results, or discussions usually have higher relevance
-        - Methodology sections without findings have lower relevance
-        - References have very low relevance
-        
-        For each segment, return only a single float value between 0.0 and 1.0, with no other text.
-        
-        {chr(10).join(segments)}
-        
-        Return one score per line, with no labels:
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
-            )
-            
-            lines = response.choices[0].message.content.strip().split('\n')
-            scores = []
-            
-            for line in lines:
-                try:
-                    # Extract number from line
-                    import re
-                    match = re.search(r"[-+]?\d*\.\d+|\d+", line)
-                    if match:
-                        score = float(match.group())
-                        # Ensure score is in range [0,1]
-                        score = max(0.0, min(1.0, score))
-                        scores.append(score)
-                    else:
-                        scores.append(0.5)  # Default if no number found
-                except:
-                    scores.append(0.5)  # Default on error
-                    
-            return scores
-        except Exception as e:
-            logger.warning(f"Failed to score segments. Error: {e}")
-            return [0.5] * len(segments)  # Default on overall failure
-
-    def score_relevance(self, segment: str) -> Tuple[float, int, int, float]:
-        """
-        Query the LLM for a domain-specific relevance score for a single segment.
-        
-        Args:
-            segment: Text segment to score
-            
-        Returns:
-            Tuple of (relevance_score, prompt_tokens, completion_tokens, processing_time)
-        """
-        prompt = f"""
-        You are a biomedical text relevance scorer.
-        Rate how relevant the following text is (0 to 1) for extracting
-        new biomedical knowledge (e.g., relationships between diseases, drugs, genes):
-
-        Text:
-        {segment}
-
-        Return only a single float value between 0.0 and 1.0, with no other text.
-        Example valid responses:
-        0.75
-        0.3
-        """
         start_time = time.time()
         try:
             response = self.client.chat.completions.create(
@@ -425,211 +399,134 @@ This is incorrect because it doesn't segment the text properly into logical chun
                 ],
                 temperature=0.1
             )
-            score_str = response.choices[0].message.content.strip()
-            # Extract first float value found in response
-            import re
-            float_matches = re.findall(r"[-+]?\d*\.\d+|\d+", score_str)
-            if float_matches:
-                score = float(float_matches[0])
-            else:
-                score = 0.5  # default if no float found
-            
+
+            content = response.choices[0].message.content.strip()
             prompt_tokens = response.usage.prompt_tokens
             completion_tokens = response.usage.completion_tokens
             processing_time = time.time() - start_time
 
-            return max(0.0, min(1.0, score)), prompt_tokens, completion_tokens, processing_time
-        except Exception as e:
-            logger.warning(f"Failed to parse relevance for segment. Error: {e}")
-            return 0.5, 0, 0, time.time() - start_time  # default
+            # Parse JSON response
+            try:
+                # Handle markdown code blocks
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
 
-class SummarizerAgent:
+                result = json.loads(content)
+                return result, prompt_tokens, completion_tokens, processing_time
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse classification JSON: {content[:200]}")
+                return {
+                    "document_type": "unknown",
+                    "software": "Unknown",
+                    "version": "N/A",
+                    "date": "N/A",
+                    "relevance_score": 0.5,
+                    "main_topics": [],
+                    "rationale": "Failed to parse response"
+                }, prompt_tokens, completion_tokens, processing_time
+
+        except Exception as e:
+            logger.error(f"Document classification failed: {str(e)}")
+            return {
+                "document_type": "unknown",
+                "software": "Unknown",
+                "version": "N/A",
+                "date": "N/A",
+                "relevance_score": 0.0,
+                "main_topics": [],
+                "rationale": f"Error: {str(e)}"
+            }, 0, 0, time.time() - start_time
+
+
+class UIElementExtractionAgent:
     """
-    Summarizer Agent (SA):
-    1) Converts high-relevance segments into concise summaries
-    2) Preserves technical details important for knowledge extraction
+    Extracts UI elements and their navigation paths from documentation.
+
+    Identifies:
+    - Buttons, menus, panels, tools, dialogs
+    - Navigation paths (Menu > Submenu > Item)
+    - UI hierarchy relationships
     """
+
     def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Summarizer Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
         self.client = client
         self.model_name = model_name
-        self.system_prompt = """You are the Summarizer Agent (SA). Your task is to convert high-relevance segments into concise summaries while retaining technical detail such as gene symbols, chemical names, or numeric data that may be crucial for entity/relationship extraction.
+        self.system_prompt = """You are a UI Element Extraction Agent for software documentation.
 
-Summarization Rules:
-- Avoid discarding domain-specific terms that could indicate potential relationships. For example, retain "IL-6" or "p53" references precisely.
-- If numeric data is relevant (e.g., concentrations, p-values), incorporate them verbatim if possible.
-- Keep the summary length under 100 words to reduce computational overhead for downstream agents.
+Your job is to identify all user interface elements mentioned in the text:
 
-Handling Irrelevant Segments:
-- If the Relevance Score is below a threshold (e.g., 0.2), you may skip or heavily compress the summary.
-- Mark extremely low relevance segments with "summary": "[OMITTED]" if not summarizable.
+UI Element Types:
+- Button: Clickable buttons (e.g., "OK button", "Save button", "Apply")
+- Menu: Top-level menus (e.g., "File menu", "Edit menu")
+- MenuItem: Items within menus (e.g., "Save As...", "Export")
+- Panel: Dockable panels/palettes (e.g., "Layers panel", "Properties panel")
+- Tool: Tools in toolbars (e.g., "Brush tool", "Selection tool", "Eraser")
+- Dialog: Popup dialogs/windows (e.g., "Export dialog", "Preferences window")
+- Tab: Tabs within panels/dialogs (e.g., "General tab", "Advanced tab")
+- Slider: Adjustment sliders (e.g., "Opacity slider", "Size slider")
+- Checkbox: Toggle options (e.g., "Anti-alias checkbox", "Preview checkbox")
+- Dropdown: Dropdown/combo boxes (e.g., "Blend Mode dropdown", "Font dropdown")
+- Toolbar: Groups of tools (e.g., "Options bar", "Tool Options")
+- Field: Input fields (e.g., "Width field", "Name field")
+- Icon: Clickable icons (e.g., "visibility icon", "lock icon")
+
+For each UI element, extract:
+1. name: The element's name/label
+2. type: One of the types above
+3. parent_path: Navigation path to reach it (e.g., "Window > Layers" or "Toolbar > Selection tools")
+4. description: What it does (if mentioned)
 
 POSITIVE EXAMPLE:
-Input: {
-  "segments": [
-    {"text": "In this study, IL-6 blockade with tocilizumab led to significant reduction in DAS28 scores (p<0.001) compared to placebo. Patients receiving 8mg/kg showed the greatest improvement (mean reduction 3.2 points).", "score": 0.90},
-    {"text": "The control group had p=0.01 in the secondary analysis.", "score": 0.75}
-  ]
-}
+Input: "To adjust opacity, use the Opacity slider in the Layers panel. You can also access layer options through Layer > Layer Style > Blending Options."
+
 Output: {
-  "summaries": [
-    {"original_text": "In this study, IL-6 blockade with tocilizumab led to significant reduction in DAS28 scores (p<0.001) compared to placebo. Patients receiving 8mg/kg showed the greatest improvement (mean reduction 3.2 points).",
-     "summary": "IL-6 blockade with tocilizumab significantly reduced DAS28 scores (p<0.001) vs placebo. The 8mg/kg dose had the best results (mean reduction 3.2 points).",
-     "score": 0.90},
-    {"original_text": "The control group had p=0.01 in the secondary analysis.",
-     "summary": "The control group showed statistical significance (p=0.01) in secondary analysis.",
-     "score": 0.75}
+  "ui_elements": [
+    {"name": "Opacity slider", "type": "Slider", "parent_path": "Layers panel", "description": "Adjusts layer opacity"},
+    {"name": "Layers panel", "type": "Panel", "parent_path": "Window > Layers", "description": ""},
+    {"name": "Layer Style", "type": "MenuItem", "parent_path": "Layer menu", "description": ""},
+    {"name": "Blending Options", "type": "MenuItem", "parent_path": "Layer > Layer Style", "description": "Layer blending settings"}
   ]
 }
 
 NEGATIVE EXAMPLE:
-Input: {
-  "segments": [
-    {"text": "In this study, IL-6 blockade with tocilizumab led to significant reduction in DAS28 scores (p<0.001) compared to placebo. Patients receiving 8mg/kg showed the greatest improvement (mean reduction 3.2 points).", "score": 0.90}
-  ]
-}
+Input: "The brush tool creates smooth strokes."
 Bad Output: {
-  "summaries": [
-    {"original_text": "In this study, IL-6 blockade with tocilizumab led to significant reduction in DAS28 scores (p<0.001) compared to placebo. Patients receiving 8mg/kg showed the greatest improvement (mean reduction 3.2 points).",
-     "summary": "A drug helped patients improve their condition.",
-     "score": 0.90}
+  "ui_elements": [
+    {"name": "smooth strokes", "type": "Feature", "parent_path": "", "description": ""}
   ]
 }
-This is incorrect because it discarded crucial technical details (IL-6, tocilizumab, DAS28 scores, p-value, dosage).
-"""
-    
-    def summarize_segment(self, segment: str) -> Tuple[str, int, int, float]:
-        """
-        Summarize a single text segment using an LLM prompt.
-        
-        Args:
-            segment: Text to summarize
-            
-        Returns:
-            Tuple of (summary, prompt_tokens, completion_tokens, processing_time)
-        """
-        prompt = f"""
-        Summarize the following biomedical text in 2-4 sentences, 
-        retaining key domain terms (genes, proteins, drugs, diseases, etc.).
-        Preserve any numeric data or statistical findings that indicate relationships.
-        Keep the summary under 100 words.
-        Provide only the summary with no additional text or formatting.
-        
-        Text:
-        {segment}
-        """
-        start_time = time.time()
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2
-            )
-            summary = response.choices[0].message.content.strip()
-            # Handle empty or invalid responses
-            if not summary:
-                summary = segment[:200] + "..."  # fallback to truncated original
-                
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
-            processing_time = time.time() - start_time
-            
-            return summary, prompt_tokens, completion_tokens, processing_time
-        except Exception as e:
-            logger.warning(f"Summarization failed. Error: {e}")
-            return segment[:200] + "...", 0, 0, time.time() - start_time  # fallback to truncated original
-
-class EntityExtractionAgent:
-    """
-    Entity Extraction Agent (EEA):
-    1) Identifies biomedical entities in summarized text
-    2) Classifies entity types and links to ontologies where possible
-    """
-    def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Entity Extraction Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
-        self.client = client
-        self.model_name = model_name
-        self.system_prompt = """You are the Entity Extraction Agent (EEA). Based on summarized text, your objective is to:
-1. Identify biomedical entities (Disease, Drug, Gene, Protein, Chemical, etc.).
-2. Link each mention to a canonical ontology reference (e.g., UMLS, MeSH, SNOMED CT).
-
-LLM-driven NER:
-- Use domain-specific knowledge to identify synonyms ("acetylsalicylic acid" → Aspirin).
-- Include multi-word expressions ("breast cancer" as a single mention).
-
-Handling Ambiguity:
-- If multiple ontology matches are possible, list the top candidate plus a short reason or partial mention of the second-best match.
-- If no suitable ontology reference is found, set "normalized_id": "N/A" and keep the raw mention.
-
-POSITIVE EXAMPLE:
-Input: {
-  "summary": "We tested Aspirin and ibuprofen for headache relief. Aspirin (100mg) was more effective for migraine, while ibuprofen (400mg) worked better for tension headaches. PTGS2 inhibition was the proposed mechanism."
-}
-Output: {
-  "entities": [
-    {"mention": "Aspirin", "type": "Drug", "normalized_id": "MESH:D001241"},
-    {"mention": "ibuprofen", "type": "Drug", "normalized_id": "MESH:D007052"},
-    {"mention": "headache", "type": "Symptom", "normalized_id": "MESH:D006261"},
-    {"mention": "migraine", "type": "Disease", "normalized_id": "MESH:D008881"},
-    {"mention": "tension headaches", "type": "Disease", "normalized_id": "MESH:D013313"},
-    {"mention": "PTGS2", "type": "Gene", "normalized_id": "NCBI:5743"}
-  ]
-}
-
-NEGATIVE EXAMPLE:
-Input: {
-  "summary": "We tested Aspirin for headache relief at a dosage of 100 mg."
-}
-Bad Output: {
-  "entities": [
-    {"mention": "Aspirin for headache relief", "type": "Medication", "normalized_id": "unknown"},
-    {"mention": "100", "type": "Measurement", "normalized_id": "N/A"},
-    {"mention": "mg", "type": "Unit", "normalized_id": "N/A"}
-  ]
-}
-This is incorrect because it didn't properly separate entities (Aspirin and headache should be separate) and created overly granular entities for dosage information.
+This is wrong because "smooth strokes" is an outcome, not a UI element. The correct extraction is:
+{"name": "Brush tool", "type": "Tool", "parent_path": "Toolbar", "description": "Creates smooth strokes"}
 """
 
-    def extract_entities(self, text: str) -> Tuple[List[KGEntity], int, int, float]:
+    def extract_ui_elements(self, text: str, software: str = "") -> Tuple[List[SoftwareEntity], int, int, float]:
         """
-        Query the LLM to identify entities.
-        
+        Extract UI elements from text.
+
         Args:
-            text: Text to extract entities from
-            
+            text: Text to extract from
+            software: Software name for context
+
         Returns:
             Tuple of (entity_list, prompt_tokens, completion_tokens, processing_time)
         """
-        prompt = f"""
-        Extract biomedical entities from the text below.
-        Include potential diseases, drugs, genes, proteins, chemicals, etc.
+        software_context = f"Software: {software}\n" if software else ""
 
-        For each entity:
-        1. Identify the exact mention in the text
-        2. Assign an entity type (Disease, Drug, Gene, Protein, Chemical, etc.)
-        3. Provide a normalized ID if possible (e.g., UMLS:C0018681 for headache)
-        
-        Format each entity as JSON: {{"mention": "...", "type": "...", "normalized_id": "..."}}
-        If no suitable ontology reference is found, set normalized_id to "N/A"
+        prompt = f"""{software_context}Extract all UI elements from this text.
 
-        Text:
-        {text}
-        """
+Text:
+{text}
+
+Return a JSON object with an "ui_elements" array. Each element should have:
+- name: Element name
+- type: One of [Button, Menu, MenuItem, Panel, Tool, Dialog, Tab, Slider, Checkbox, Dropdown, Toolbar, Field, Icon]
+- parent_path: Navigation path (e.g., "Edit menu" or "Window > Properties")
+- description: What it does (brief, or empty string if not described)
+
+Return only valid JSON."""
+
         start_time = time.time()
         try:
             response = self.client.chat.completions.create(
@@ -640,151 +537,430 @@ This is incorrect because it didn't properly separate entities (Aspirin and head
                 ],
                 temperature=0.1
             )
-            
+
             content = response.choices[0].message.content.strip()
-            entity_list = []
-            
-            # Try to parse JSON entities from the response
-            try:
-                # Check if response contains JSON array
-                if "[" in content and "]" in content:
-                    json_str = content[content.find("["):content.rfind("]")+1]
-                    entities_data = json.loads(json_str)
-                    for ent_data in entities_data:
-                        if isinstance(ent_data, dict) and "mention" in ent_data:
-                            entity_list.append(KGEntity(
-                                entity_id=ent_data.get("mention", ""),
-                                entity_type=ent_data.get("type", "Unknown"),
-                                name=ent_data.get("mention", ""),
-                                normalized_id=ent_data.get("normalized_id", "N/A")
-                            ))
-                else:
-                    # Fallback: extract entities line by line
-                    for line in content.split('\n'):
-                        if ':' in line and len(line) > 5:  # Simple heuristic for entity lines
-                            # Basic extraction
-                            mention = line.split(':')[0].strip()
-                            entity_list.append(KGEntity(
-                                entity_id=mention,
-                                name=mention
-                            ))
-            except json.JSONDecodeError:
-                # Fallback for line-by-line extraction if JSON parsing fails
-                for line in content.split('\n'):
-                    line = line.strip()
-                    if line and len(line) > 2:  # Skip empty lines
-                        entity_list.append(KGEntity(
-                            entity_id=line,
-                            name=line
-                        ))
-                    
             prompt_tokens = response.usage.prompt_tokens
             completion_tokens = response.usage.completion_tokens
             processing_time = time.time() - start_time
-            
-            return entity_list, prompt_tokens, completion_tokens, processing_time
+
+            entities = []
+            try:
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                ui_elements = data.get("ui_elements", [])
+
+                for elem in ui_elements:
+                    entity = SoftwareEntity(
+                        entity_id=f"ui_{elem.get('name', '').lower().replace(' ', '_')}",
+                        name=elem.get("name", ""),
+                        entity_type=EntityType.UI_ELEMENT,
+                        description=elem.get("description", ""),
+                        parent_path=elem.get("parent_path", ""),
+                        software=software
+                    )
+                    if entity.name:
+                        entities.append(entity)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse UI elements JSON")
+
+            return entities, prompt_tokens, completion_tokens, processing_time
+
         except Exception as e:
-            logger.warning(f"Entity extraction failed. Error: {e}")
+            logger.error(f"UI element extraction failed: {str(e)}")
             return [], 0, 0, time.time() - start_time
+
+
+class FeatureExtractionAgent:
+    """
+    Extracts software features, capabilities, and concepts.
+
+    Identifies:
+    - Features and capabilities
+    - Concepts and terminology
+    - Settings and configuration options
+    - File formats supported
+    - Constraints and requirements
+    """
+
+    def __init__(self, client: OpenAI, model_name: str):
+        self.client = client
+        self.model_name = model_name
+        self.system_prompt = """You are a Feature Extraction Agent for software documentation.
+
+Your job is to identify features, concepts, and capabilities mentioned in the text:
+
+Entity Types to Extract:
+- Feature: A capability or function (e.g., "Content-Aware Fill", "Auto-Save", "Layer Masking", "Spell Check")
+- Concept: Domain terminology users need to understand (e.g., "Layer", "Mask", "Resolution", "DPI", "Vector")
+- Setting: Configuration options (e.g., "Auto-Save Interval", "Default Font", "Grid Size")
+- FileFormat: Supported file types (e.g., "PSD", "PNG", "PDF", "DOCX")
+- Constraint: Limitations or requirements (e.g., "Requires 8GB RAM", "Only works in RGB mode")
+- Shortcut: Keyboard shortcuts (e.g., "Ctrl+S", "Cmd+Z", "Shift+Click")
+- Outcome: Results of actions (e.g., "transparent background", "sharpened image", "merged layers")
+
+For each entity, extract:
+1. name: The entity's name
+2. type: One of the types above
+3. description: What it is or does
+4. related_to: Other entities it's related to (if mentioned)
+
+POSITIVE EXAMPLE:
+Input: "Content-Aware Fill intelligently fills selected areas by analyzing surrounding pixels. This feature requires a selection to be active. Press Shift+F5 to access it quickly. The result is a seamlessly filled area."
+
+Output: {
+  "entities": [
+    {"name": "Content-Aware Fill", "type": "Feature", "description": "Intelligently fills selected areas by analyzing surrounding pixels", "related_to": ["selection"]},
+    {"name": "selection", "type": "Concept", "description": "Active selected area required for Content-Aware Fill", "related_to": ["Content-Aware Fill"]},
+    {"name": "Shift+F5", "type": "Shortcut", "description": "Quick access to Content-Aware Fill", "related_to": ["Content-Aware Fill"]},
+    {"name": "seamlessly filled area", "type": "Outcome", "description": "Result of Content-Aware Fill", "related_to": ["Content-Aware Fill"]}
+  ]
+}
+
+NEGATIVE EXAMPLE:
+Input: "Click the button to save your file."
+Bad Output: {
+  "entities": [
+    {"name": "Click", "type": "Feature", "description": "Clicking action", "related_to": []}
+  ]
+}
+This is wrong because "Click" is an action, not a feature. "Save" would be the feature here.
+"""
+
+    def extract_features(self, text: str, software: str = "") -> Tuple[List[SoftwareEntity], int, int, float]:
+        """
+        Extract features and concepts from text.
+
+        Args:
+            text: Text to extract from
+            software: Software name for context
+
+        Returns:
+            Tuple of (entity_list, prompt_tokens, completion_tokens, processing_time)
+        """
+        software_context = f"Software: {software}\n" if software else ""
+
+        prompt = f"""{software_context}Extract all features, concepts, settings, file formats, shortcuts, and outcomes from this text.
+
+Text:
+{text}
+
+Return a JSON object with an "entities" array. Each entity should have:
+- name: Entity name
+- type: One of [Feature, Concept, Setting, FileFormat, Constraint, Shortcut, Outcome]
+- description: What it is/does
+- related_to: List of related entity names (can be empty)
+
+Return only valid JSON."""
+
+        start_time = time.time()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+
+            content = response.choices[0].message.content.strip()
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+            processing_time = time.time() - start_time
+
+            entities = []
+            try:
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                entity_list = data.get("entities", [])
+
+                type_mapping = {
+                    "Feature": EntityType.FEATURE,
+                    "Concept": EntityType.CONCEPT,
+                    "Setting": EntityType.SETTING,
+                    "FileFormat": EntityType.FILE_FORMAT,
+                    "Constraint": EntityType.CONSTRAINT,
+                    "Shortcut": EntityType.SHORTCUT,
+                    "Outcome": EntityType.OUTCOME
+                }
+
+                for elem in entity_list:
+                    entity_type = type_mapping.get(elem.get("type", ""), EntityType.UNKNOWN)
+                    entity = SoftwareEntity(
+                        entity_id=f"{entity_type.value.lower()}_{elem.get('name', '').lower().replace(' ', '_')}",
+                        name=elem.get("name", ""),
+                        entity_type=entity_type,
+                        description=elem.get("description", ""),
+                        software=software
+                    )
+                    if entity.name:
+                        entities.append(entity)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse features JSON")
+
+            return entities, prompt_tokens, completion_tokens, processing_time
+
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {str(e)}")
+            return [], 0, 0, time.time() - start_time
+
+
+class ProcedureExtractionAgent:
+    """
+    Extracts step-by-step procedures and workflows.
+
+    Identifies:
+    - Complete procedures with ordered steps
+    - Prerequisites for procedures
+    - Expected outcomes
+    """
+
+    def __init__(self, client: OpenAI, model_name: str):
+        self.client = client
+        self.model_name = model_name
+        self.system_prompt = """You are a Procedure Extraction Agent for software documentation.
+
+Your job is to identify step-by-step procedures and workflows from the text.
+
+For each procedure, extract:
+1. name: A descriptive name for the procedure (e.g., "Remove Background from Image")
+2. description: Brief summary of what the procedure accomplishes
+3. prerequisites: What must be true/done before starting (e.g., "Image must be open", "Layer must be unlocked")
+4. steps: Ordered list of steps, each step should be:
+   - A clear, actionable instruction
+   - Reference specific UI elements when mentioned
+   - Be specific enough to follow
+5. outcome: What the user will achieve after completing the procedure
+
+POSITIVE EXAMPLE:
+Input: "To remove the background from an image:
+First, make sure your image layer is unlocked. Click the lock icon if needed.
+Then, go to the Properties panel and look for Quick Actions.
+Click the Remove Background button.
+Photoshop will automatically create a layer mask, giving you a transparent background."
+
+Output: {
+  "procedures": [
+    {
+      "name": "Remove Background from Image",
+      "description": "Automatically remove the background from an image using AI",
+      "prerequisites": ["Image must be open", "Image layer must be unlocked"],
+      "steps": [
+        "Ensure the image layer is unlocked (click the lock icon if locked)",
+        "Open the Properties panel",
+        "Locate the Quick Actions section",
+        "Click the Remove Background button",
+        "Wait for Photoshop to process and create a layer mask"
+      ],
+      "outcome": "Image with transparent background (layer mask applied)"
+    }
+  ]
+}
+
+NEGATIVE EXAMPLE:
+Input: "The brush tool is great for painting. You can adjust the size."
+Bad Output: {
+  "procedures": [
+    {
+      "name": "Use Brush",
+      "steps": ["Use the brush tool", "Paint"]
+    }
+  ]
+}
+This is wrong because the text doesn't describe a complete procedure with clear steps. It's just a description of a tool.
+
+Only extract procedures when there are clear, sequential steps to follow. Don't create procedures from general descriptions.
+"""
+
+    def extract_procedures(self, text: str, software: str = "") -> Tuple[List[Procedure], int, int, float]:
+        """
+        Extract procedures from text.
+
+        Args:
+            text: Text to extract from
+            software: Software name for context
+
+        Returns:
+            Tuple of (procedure_list, prompt_tokens, completion_tokens, processing_time)
+        """
+        software_context = f"Software: {software}\n" if software else ""
+
+        prompt = f"""{software_context}Extract all step-by-step procedures from this text.
+
+Text:
+{text}
+
+Return a JSON object with a "procedures" array. Each procedure should have:
+- name: Descriptive procedure name
+- description: What it accomplishes
+- prerequisites: List of requirements before starting (can be empty)
+- steps: Ordered list of step instructions
+- outcome: What user achieves at the end
+
+Only extract actual procedures with clear sequential steps. Don't invent steps that aren't in the text.
+Return only valid JSON. Return empty array if no clear procedures are found."""
+
+        start_time = time.time()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+
+            content = response.choices[0].message.content.strip()
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+            processing_time = time.time() - start_time
+
+            procedures = []
+            try:
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                proc_list = data.get("procedures", [])
+
+                for i, proc in enumerate(proc_list):
+                    procedure = Procedure(
+                        procedure_id=f"proc_{i}_{proc.get('name', 'unknown').lower().replace(' ', '_')[:30]}",
+                        name=proc.get("name", ""),
+                        description=proc.get("description", ""),
+                        steps=proc.get("steps", []),
+                        prerequisites=proc.get("prerequisites", []),
+                        outcome=proc.get("outcome", ""),
+                        software=software
+                    )
+                    if procedure.name and procedure.steps:
+                        procedures.append(procedure)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse procedures JSON")
+
+            return procedures, prompt_tokens, completion_tokens, processing_time
+
+        except Exception as e:
+            logger.error(f"Procedure extraction failed: {str(e)}")
+            return [], 0, 0, time.time() - start_time
+
 
 class RelationshipExtractionAgent:
     """
-    Relationship Extraction Agent (REA):
-    1) Identifies relationships between extracted entities
-    2) Classifies relationship types
+    Extracts relationships between entities.
+
+    Identifies:
+    - UI navigation relationships (located_in, contains)
+    - Feature dependencies (requires, enables)
+    - Procedural relationships (achieves, prerequisite_for)
+    - Shortcut mappings
     """
+
     def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Relationship Extraction Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
         self.client = client
         self.model_name = model_name
-        self.system_prompt = """You are the Relationship Extraction Agent (REA). Given a text snippet plus a set of recognized entities, your mission is to detect possible relationships (e.g., treats, causes, interactsWith, inhibits).
+        self.system_prompt = """You are a Relationship Extraction Agent for software documentation.
 
-LLM-based Relation Classification:
-- Consider grammar structures (e.g., "X was observed to inhibit Y") and domain patterns ("X reduces expression of Y").
-- Allow multiple relationship candidates if the text is ambiguous or suggests multiple interactions.
+Given text and a list of entities, identify relationships between them.
 
-Negative Relation Handling:
-- If the text says "Aspirin does not treat migraine," the relationship (Aspirin, treats, migraine) is negative. Output no relationship in such cases.
-- Recognize negation cues ("no effect", "absence of association").
+Relationship Types:
+UI Navigation:
+- located_in: UI element is inside another (e.g., "Opacity slider" located_in "Layers panel")
+- accessed_via: How to reach something (e.g., "Export" accessed_via "File menu")
+- contains: Parent contains child (e.g., "Toolbar" contains "Brush tool")
+
+Feature Relationships:
+- activates: UI element triggers feature (e.g., "Remove Background button" activates "Background Removal")
+- requires: Must have/do first (e.g., "Layer Mask" requires "Active Layer")
+- enables: Makes possible (e.g., "Selection" enables "Content-Aware Fill")
+- enhances: Improves another (e.g., "Refine Edge" enhances "Selection")
+- conflicts_with: Can't use together (e.g., "CMYK mode" conflicts_with "Some filters")
+- alternative_to: Different way to same result (e.g., "Quick Selection" alternative_to "Magic Wand")
+
+Procedure Relationships:
+- achieves: Produces outcome (e.g., "Remove Background procedure" achieves "Transparent background")
+- prerequisite_for: Must do before (e.g., "Unlock layer" prerequisite_for "Edit layer")
+
+Shortcuts and Settings:
+- shortcut_for: Keyboard shortcut (e.g., "Ctrl+Z" shortcut_for "Undo")
+- configured_by: Setting controls feature (e.g., "Auto-Save" configured_by "Auto-Save Interval")
 
 POSITIVE EXAMPLE:
-Input: {
-  "summary": "Aspirin was shown to reduce headaches by inhibiting prostaglandin synthesis. It has no effect on hypertension.",
-  "entities": [
-    {"mention": "Aspirin", "type": "Drug", "normalized_id": "MESH:D001241"},
-    {"mention": "headaches", "type": "Disease", "normalized_id": "MESH:D006261"},
-    {"mention": "prostaglandin", "type": "Chemical", "normalized_id": "MESH:D011453"},
-    {"mention": "hypertension", "type": "Disease", "normalized_id": "MESH:D006973"}
-  ]
-}
+Input Text: "The Brush tool in the toolbar lets you paint. Press B to select it quickly. Adjust size using the Size slider in the Options bar."
+Entities: [Brush tool, toolbar, B shortcut, Size slider, Options bar]
+
 Output: {
   "relationships": [
-    {"head": "Aspirin", "relation": "treats", "tail": "headaches", "confidence": 0.95},
-    {"head": "Aspirin", "relation": "inhibits", "tail": "prostaglandin", "confidence": 0.90}
+    {"head": "Brush tool", "relation": "located_in", "tail": "toolbar", "confidence": 0.95},
+    {"head": "B", "relation": "shortcut_for", "tail": "Brush tool", "confidence": 0.95},
+    {"head": "Size slider", "relation": "located_in", "tail": "Options bar", "confidence": 0.90},
+    {"head": "Size slider", "relation": "configured_by", "tail": "Brush tool", "confidence": 0.80}
   ]
 }
-Note: No relationship is extracted between Aspirin and hypertension due to the negation.
 
 NEGATIVE EXAMPLE:
-Input: {
-  "summary": "Aspirin was shown to reduce headaches by inhibiting prostaglandin synthesis.",
-  "entities": [
-    {"mention": "Aspirin", "type": "Drug", "normalized_id": "MESH:D001241"},
-    {"mention": "headaches", "type": "Disease", "normalized_id": "MESH:D006261"},
-    {"mention": "prostaglandin", "type": "Chemical", "normalized_id": "MESH:D011453"}
-  ]
-}
+Input: "Photoshop is great software."
+Entities: [Photoshop]
 Bad Output: {
   "relationships": [
-    {"head": "prostaglandin", "relation": "causes", "tail": "headaches", "confidence": 0.8}
+    {"head": "Photoshop", "relation": "is", "tail": "great software", "confidence": 0.9}
   ]
 }
-This is incorrect because the text doesn't explicitly state this relationship. While it might be inferred, we should only extract relationships directly supported by the text.
+This is wrong because "is great software" is not an entity and "is" is not a valid relationship type. Only extract relationships between identified entities using defined relationship types.
 """
 
-    def extract_relationships(self, text: str, entities: List[KGEntity]) -> Tuple[List[KnowledgeTriple], int, int, float]:
+    def extract_relationships(self, text: str, entities: List[SoftwareEntity]) -> Tuple[List[UsageKnowledgeTriple], int, int, float]:
         """
-        Query the LLM to identify relationships among provided entities.
-        
+        Extract relationships between entities.
+
         Args:
             text: Source text
             entities: List of entities to find relationships between
-            
+
         Returns:
-            Tuple of (relationship_list, prompt_tokens, completion_tokens, processing_time)
+            Tuple of (triple_list, prompt_tokens, completion_tokens, processing_time)
         """
         if not entities:
             return [], 0, 0, 0.0
 
-        # Format the entity list for the LLM
-        entity_bullets = "\n".join(f"- {ent.name} (Type: {ent.entity_type})" for ent in entities)
-        
-        prompt = f"""
-        We have these entities of interest:
-        {entity_bullets}
+        entity_list = "\n".join([f"- {e.name} ({e.entity_type.value})" for e in entities])
 
-        From the text below, identify direct relationships between these entities.
-        Use standardized relationships such as 'treats', 'causes', 'inhibits', 'activates', 'interacts_with', 'associated_with', etc.
-        
-        For each relationship, provide:
-        1. Head entity (subject)
-        2. Relation type
-        3. Tail entity (object)
-        4. A confidence score (0-1) for how certain the relationship is expressed in the text
-        
-        Format as JSON: {{"head": "...", "relation": "...", "tail": "...", "confidence": 0.X}}
-        
-        If no relationships are found, return an empty array.
+        prompt = f"""Given this text and list of entities, extract relationships between them.
 
-        Text:
-        {text}
-        """
+Text:
+{text}
+
+Entities:
+{entity_list}
+
+Valid relationship types:
+- located_in, accessed_via, contains (UI navigation)
+- activates, requires, enables, enhances, conflicts_with, alternative_to (features)
+- achieves, prerequisite_for (procedures)
+- shortcut_for, configured_by (shortcuts/settings)
+
+Return a JSON object with a "relationships" array. Each relationship:
+- head: Subject entity name (must be from entity list)
+- relation: One of the valid relationship types
+- tail: Object entity name (must be from entity list)
+- confidence: 0.0 to 1.0
+
+Only extract relationships explicitly supported by the text.
+Return only valid JSON."""
 
         start_time = time.time()
         try:
@@ -796,512 +972,148 @@ This is incorrect because the text doesn't explicitly state this relationship. W
                 ],
                 temperature=0.1
             )
-            
+
             content = response.choices[0].message.content.strip()
-            triples: List[KnowledgeTriple] = []
-            
-            # Try to parse JSON from the response
-            try:
-                if "[" in content and "]" in content:
-                    json_str = content[content.find("["):content.rfind("]")+1]
-                    relations_data = json.loads(json_str)
-                    
-                    for rel in relations_data:
-                        if isinstance(rel, dict) and "head" in rel and "relation" in rel and "tail" in rel:
-                            # Basic data validation
-                            head = rel.get("head", "").strip()
-                            relation = rel.get("relation", "").strip()
-                            tail = rel.get("tail", "").strip()
-                            
-                            if head and relation and tail:
-                                confidence = float(rel.get("confidence", 0.5))
-                                # Get clarity and relevance scores
-                                clarity, clarity_tokens = self._estimate_metric(head, relation, tail, "clarity")
-                                relevance, relevance_tokens = self._estimate_metric(head, relation, tail, "relevance")
-                                
-                                triples.append(KnowledgeTriple(
-                                    head=head,
-                                    relation=relation,
-                                    tail=tail,
-                                    confidence=confidence,
-                                    clarity=clarity,
-                                    relevance=relevance,
-                                    source="relationship_extraction"
-                                ))
-                else:
-                    # Fallback: extract relationships line by line
-                    for line in content.split('\n'):
-                        if '->' in line:
-                            parts = [p.strip() for p in line.split('->')]
-                            if len(parts) == 3:
-                                head, relation, tail = parts
-                                triples.append(KnowledgeTriple(
-                                    head=head,
-                                    relation=relation,
-                                    tail=tail,
-                                    confidence=0.5,  # Default confidence
-                                    clarity=0.5,     # Default clarity
-                                    relevance=0.5,   # Default relevance
-                                    source="relationship_extraction"
-                                ))
-            except json.JSONDecodeError:
-                # Simple line-by-line fallback
-                for line in content.split('\n'):
-                    if '->' in line:
-                        parts = [p.strip() for p in line.split('->')]
-                        if len(parts) == 3:
-                            head, relation, tail = parts
-                            triples.append(KnowledgeTriple(
-                                head=head,
-                                relation=relation,
-                                tail=tail,
-                                confidence=0.5,
-                                clarity=0.5,
-                                relevance=0.5,
-                                source="relationship_extraction"
-                            ))
-                        
             prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens 
+            completion_tokens = response.usage.completion_tokens
             processing_time = time.time() - start_time
-            
+
+            triples = []
+            entity_map = {e.name.lower(): e for e in entities}
+
+            try:
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                relationships = data.get("relationships", [])
+
+                for rel in relationships:
+                    head_name = rel.get("head", "")
+                    tail_name = rel.get("tail", "")
+
+                    # Look up entity types
+                    head_entity = entity_map.get(head_name.lower())
+                    tail_entity = entity_map.get(tail_name.lower())
+
+                    triple = UsageKnowledgeTriple(
+                        head=head_name,
+                        relation=rel.get("relation", "related_to"),
+                        tail=tail_name,
+                        head_type=head_entity.entity_type if head_entity else EntityType.UNKNOWN,
+                        tail_type=tail_entity.entity_type if tail_entity else EntityType.UNKNOWN,
+                        confidence=float(rel.get("confidence", 0.5)),
+                        status=TripleStatus.ACTIVE
+                    )
+                    if triple.head and triple.tail:
+                        triples.append(triple)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse relationships JSON")
+
             return triples, prompt_tokens, completion_tokens, processing_time
+
         except Exception as e:
-            logger.warning(f"Relationship extraction failed. Error: {e}")
+            logger.error(f"Relationship extraction failed: {str(e)}")
             return [], 0, 0, time.time() - start_time
 
-    def _estimate_metric(self, head: str, relation: str, tail: str, metric_type: str) -> Tuple[float, int]:
-        """
-        Estimate clarity or relevance for a triple.
-        
-        Args:
-            head: Subject entity
-            relation: Relationship type
-            tail: Object entity
-            metric_type: Either "clarity" or "relevance"
-            
-        Returns:
-            Tuple of (metric_score, tokens_used)
-        """
-        prompt = f"""
-        Evaluate the {metric_type} of this relationship triple:
-        "{head} -> {relation} -> {tail}"
 
-        For clarity, consider:
-        - Whether the terms are specific and unambiguous
-        - Whether the relationship is well-defined
-        
-        For relevance, consider:
-        - How important this relationship is in the biomedical domain
-        - Whether it captures significant knowledge
-        
-        Return a single float between 0.01 and 0.99 representing the {metric_type} score.
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": f"You evaluate {metric_type} of biomedical relationships."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,
-                max_tokens=4096
-            )
-            
-            content = response.choices[0].message.content.strip()
-            tokens_used = response.usage.prompt_tokens + response.usage.completion_tokens
-            
-            # Extract the score
-            import re
-            matches = re.findall(r"[-+]?\d*\.\d+|\d+", content)
-            if matches:
-                score = float(matches[0])
-                # Ensure score is in range [0.01, 0.99]
-                score = max(0.01, min(0.99, score))
-                return score, tokens_used
-            else:
-                return 0.5, tokens_used  # Default
-        except Exception as e:
-            logger.warning(f"Failed to estimate {metric_type}. Error: {e}")
-            return 0.5, 0  # Default on error
+class VersionResolutionAgent:
+    """
+    Assigns version metadata to extracted knowledge.
 
-class SchemaAlignmentAgent:
+    Determines:
+    - When features/UI elements were introduced
+    - Version ranges where knowledge is valid
+    - Version-specific variations
     """
-    Schema Alignment Agent (SAA):
-    1) Maps extracted entities to standard schema types
-    2) Normalizes relationship labels
-    """
+
     def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Schema Alignment Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
         self.client = client
         self.model_name = model_name
-        self.system_prompt = """You are the Schema Alignment Agent (SAA). Newly extracted entities or relationships may not match existing KG classes or relation types. Your job is to determine how they should map onto the existing ontology or schema.
+        self.system_prompt = """You are a Version Resolution Agent for software documentation.
 
-Ontology Reference:
-- For each unknown entity, propose a parent type from {Drug, Disease, Gene, Chemical, Protein, Pathway, Symptom, ...} if not in the KG.
-- For each unknown relation, map it to an existing relation if semantically close. Otherwise, propose a new label.
+Your job is to analyze extracted knowledge and assign version information:
 
-Confidence Computation:
-- Consider lexical similarity, embedding distance, or domain rules (e.g., if an entity ends with "-in" or "-ase", it might be a protein or enzyme).
-- Provide a final numeric score for how certain you are of the proposed alignment.
+1. Detect explicit version mentions in text
+2. Infer version applicability from context
+3. Identify version-specific features or changes
+
+Version Information to Extract:
+- introduced_version: When this first became true (e.g., "2020", "v5.0", "CC 2019")
+- valid_range: Range of versions (e.g., "2020+", "2019-2023", "all versions")
+- version_notes: Any version-specific caveats
+
+Guidelines:
+- If text says "new in version X" -> introduced_version = X
+- If text says "available since X" -> introduced_version = X, valid_range = "X+"
+- If text says "removed in X" -> valid_range should end at X
+- If no version info -> valid_range = "unknown" (don't guess)
 
 POSITIVE EXAMPLE:
-Input: {
-  "unknown_entities": ["TNF-alpha", "miR-21", "PDE4", "blood-brain barrier"],
-  "unknown_relations": ["overexpresses", "disrupts"]
-}
+Input Triple: "Generative Fill" -[requires]-> "Selection"
+Context: "Generative Fill, introduced in Photoshop 2023, requires an active selection..."
+
 Output: {
-  "alignments": [
-    {"id": "TNF-alpha", "proposed_type": "Protein", "status": "mapped", "confidence": 0.95},
-    {"id": "miR-21", "proposed_type": "RNA", "status": "new", "confidence": 0.90},
-    {"id": "PDE4", "proposed_type": "Enzyme", "status": "mapped", "confidence": 0.85},
-    {"id": "blood-brain barrier", "proposed_type": "Anatomical_Structure", "status": "mapped", "confidence": 0.95}
-  ],
-  "new_relations": [
-    {"relation": "overexpresses", "closest_match": "upregulates", "status": "mapped", "confidence": 0.85},
-    {"relation": "disrupts", "closest_match": "damages", "status": "new", "confidence": 0.70}
-  ]
+  "introduced_version": "2023",
+  "valid_range": "2023+",
+  "version_notes": "New AI feature in Photoshop 2023"
 }
 
 NEGATIVE EXAMPLE:
-Input: {
-  "unknown_entities": ["TNF-alpha", "miR-21"],
-  "unknown_relations": ["overexpresses"]
-}
+Input Triple: "Brush tool" -[located_in]-> "Toolbar"
+Context: "The Brush tool is in the toolbar."
+
 Bad Output: {
-  "alignments": [
-    {"id": "TNF-alpha", "proposed_type": "Unknown", "status": "unknown"},
-    {"id": "miR-21", "proposed_type": "Unknown", "status": "unknown"}
-  ],
-  "new_relations": [
-    {"relation": "overexpresses", "closest_match": "unknown", "status": "unknown"}
-  ]
+  "introduced_version": "1990",
+  "valid_range": "1990+"
 }
-This is incorrect because the agent should use domain knowledge to propose appropriate entity types and relation mappings, rather than marking everything as unknown.
+This is wrong because we shouldn't guess historical versions. Correct output:
+{
+  "introduced_version": "",
+  "valid_range": "unknown",
+  "version_notes": "Core feature, likely available in all versions"
+}
 """
 
-    def align_entities(self, entities: List[KGEntity]) -> Tuple[List[KGEntity], int, int, float]:
+    def resolve_versions(self, triples: List[UsageKnowledgeTriple], context: str, detected_version: str = "") -> Tuple[List[UsageKnowledgeTriple], int, int, float]:
         """
-        Attempt to classify each entity type via LLM or external ontology.
-        
+        Add version metadata to triples.
+
         Args:
-            entities: List of entities to classify
-            
+            triples: Triples to add version info to
+            context: Source text for version clues
+            detected_version: Version detected from document
+
         Returns:
-            Tuple of (aligned_entities, prompt_tokens, completion_tokens, processing_time)
+            Tuple of (updated_triples, prompt_tokens, completion_tokens, processing_time)
         """
-        start_time = time.time()
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        
-        aligned = []
-        
-        # Process entities in batches to be more efficient
-        batch_size = 10
-        for i in range(0, len(entities), batch_size):
-            batch = entities[i:i+batch_size]
-            batch_results, pt, ct = self._batch_classify_entity_types(batch)
-            
-            total_prompt_tokens += pt
-            total_completion_tokens += ct
-            
-            for original_entity, classification in zip(batch, batch_results):
-                if classification:
-                    original_entity.entity_type = classification
-                aligned.append(original_entity)
-            
-        processing_time = time.time() - start_time
-        return aligned, total_prompt_tokens, total_completion_tokens, processing_time
+        if not triples:
+            return [], 0, 0, 0.0
 
-    def _batch_classify_entity_types(self, entities: List[KGEntity]) -> Tuple[List[str], int, int]:
-        """
-        Classify multiple entities at once for efficiency.
-        
-        Args:
-            entities: List of entities to classify
-            
-        Returns:
-            Tuple of (classifications, prompt_tokens, completion_tokens)
-        """
-        entity_names = [ent.name for ent in entities]
-        entities_text = "\n".join([f"{i+1}. {name}" for i, name in enumerate(entity_names)])
-        
-        prompt = f"""
-        Classify each entity by its biomedical type: Drug, Disease, Gene, Protein, Chemical, RNA, Pathway, Cell, or Other.
-        
-        Entities:
-        {entities_text}
-        
-        Return classifications one per line, numbered to match the input:
-        1. [Type]
-        2. [Type]
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0
-            )
-            
-            lines = response.choices[0].message.content.strip().split('\n')
-            classifications = []
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Parse numbered responses
-                if '.' in line:
-                    parts = line.split('.', 1)
-                    if len(parts) == 2 and parts[1].strip():
-                        classifications.append(parts[1].strip())
-                else:
-                    # If response isn't numbered, just use the line
-                    classifications.append(line)
-            
-            # Pad with "Unknown" if some entities didn't get classified
-            while len(classifications) < len(entities):
-                classifications.append("Unknown")
-                
-            # Truncate if we somehow got more classifications than entities
-            classifications = classifications[:len(entities)]
-            
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
-            
-            return classifications, prompt_tokens, completion_tokens
-        except Exception as e:
-            logger.warning(f"Entity type classification failed. Error: {e}")
-            return ["Unknown"] * len(entities), 0, 0
+        triple_descriptions = "\n".join([f"{i+1}. {t}" for i, t in enumerate(triples)])
+        version_context = f"Document version: {detected_version}\n" if detected_version else ""
 
-    def align_relationships(self, triples: List[KnowledgeTriple]) -> List[KnowledgeTriple]:
-        """
-        Unify relationship labels to a standard set.
-        
-        Args:
-            triples: List of triples to normalize relations for
-            
-        Returns:
-            List of triples with normalized relations
-        """
-        aligned_triples = []
-        for t in triples:
-            normalized_rel = self._normalize_relation(t.relation)
-            t.relation = normalized_rel
-            aligned_triples.append(t)
-        return aligned_triples
+        prompt = f"""{version_context}Analyze these knowledge triples and determine version information for each.
 
-    def _normalize_relation(self, relation: str) -> str:
-        """
-        Standardize relation labels to canonical forms.
-        
-        Args:
-            relation: Relation label to normalize
-            
-        Returns:
-            Normalized relation label
-        """
-        # Standard mapping of similar relations, just an example
-        synonyms = {
-            "inhibit": "inhibits",
-            "inhibited": "inhibits",
-            "inhibits": "inhibits",
-            "treat": "treats",
-            "treated": "treats",
-            "treats": "treats",
-            "cause": "causes",
-            "caused": "causes",
-            "causes": "causes",
-            "activate": "activates",
-            "activates": "activates",
-            "regulates": "regulates",
-            "regulate": "regulates",
-            "regulated": "regulates",
-            "associated with": "associated_with",
-            "associatedwith": "associated_with",
-            "associated_with": "associated_with",
-            "interacts with": "interacts_with",
-            "interactswith": "interacts_with",
-            "interacts_with": "interacts_with",
-            "binds to": "binds_to",
-            "bindsto": "binds_to",
-            "binds_to": "binds_to"
-        }
-        
-        base = relation.lower().strip()
-        # Return the mapped version or the original if no mapping exists
-        return synonyms.get(base, base)
+Triples:
+{triple_descriptions}
 
-class ConflictResolutionAgent:
-    """
-    Conflict Resolution Agent (CRA):
-    1) Checks if newly extracted triplets conflict with existing knowledge
-    2) Decides whether to keep, discard, or flag them for manual review
-    """
-    def __init__(self, client: OpenAI, model_name: str):
-        """
-        Initialize the Conflict Resolution Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-        """
-        self.client = client
-        self.model_name = model_name
-        self.system_prompt = """You are the Conflict Resolution Agent (CRA). Sometimes new triplets are detected that contradict existing knowledge (e.g., (DrugX, causes, DiseaseY) vs. (DrugX, treats, DiseaseY)). Your role is to classify these into Contradict, Agree, or Ambiguous, and decide whether the new triplet should be discarded, flagged for expert review, or integrated with caution.
+Context from document:
+{context[:2000]}
 
-LLM-based Debate:
-- Use domain knowledge to see if relationships can coexist (e.g., inhibits vs. activates are typically contradictory for the same target).
-- Consider partial contexts, e.g., different dosages or subpopulations.
+For each triple (numbered), provide:
+- introduced_version: Version when this became true (empty string if unknown)
+- valid_range: Version range like "2020+", "2019-2023", or "unknown"
+- version_notes: Brief note about version applicability
 
-Escalation Criteria:
-- If the new triplet has high confidence but conflicts with old data that has lower confidence, consider overriding or review.
-- If both are high confidence, label Contradict, prompt manual verification.
+Return JSON with "versions" array, one entry per triple in order:
+{{"versions": [{{"introduced_version": "...", "valid_range": "...", "version_notes": "..."}}, ...]}}
 
-POSITIVE EXAMPLE:
-Input: {
-  "t_new": {"head": "Aspirin", "relation": "treats", "tail": "Headache", "confidence": 0.95},
-  "t_existing": {"head": "Aspirin", "relation": "causes", "tail": "Headache", "confidence": 0.70}
-}
-Output: {
-  "decision": "Contradict",
-  "resolution": {
-    "action": "review",
-    "rationale": "These represent opposite effects. However, Aspirin can both treat existing headaches and cause headaches as a side effect in some individuals. Expert validation needed to clarify contexts."
-  }
-}
+Return only valid JSON."""
 
-NEGATIVE EXAMPLE:
-Input: {
-  "t_new": {"head": "DrugX", "relation": "treats", "tail": "DiseaseY", "confidence": 0.95},
-  "t_existing": {"head": "DrugX", "relation": "causes", "tail": "DiseaseY", "confidence": 0.40}
-}
-Bad Output: {
-  "decision": "Agree",
-  "resolution": {"action": "integrate", "rationale": "Both can be true."}
-}
-This is incorrect because it fails to recognize the direct contradiction between treats and causes, and doesn't provide a sufficiently detailed rationale.
-"""
-
-    def resolve_conflicts(
-        self, 
-        new_triples: List[KnowledgeTriple],
-        existing_triples: List[KnowledgeTriple]
-    ) -> Tuple[List[KnowledgeTriple], int, int, float]:
-        """
-        Compare each new triple against existing ones for direct contradictions.
-        
-        Args:
-            new_triples: Newly extracted triples
-            existing_triples: Existing knowledge graph triples
-            
-        Returns:
-            Tuple of (final_triples, prompt_tokens, completion_tokens, processing_time)
-        """
-        start_time = time.time()
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        
-        final_triples = []
-        for nt in new_triples:
-            # Check if new triple directly contradicts any existing triple
-            conflicting_triple = self._find_contradiction(nt, existing_triples)
-            
-            if conflicting_triple:
-                # Use LLM to decide between conflicting triples
-                keep, pt, ct, _ = self._resolve_contradiction(nt, conflicting_triple)
-                total_prompt_tokens += pt
-                total_completion_tokens += ct
-                
-                if keep:
-                    final_triples.append(nt)
-            else:
-                # No conflict, keep the triple
-                final_triples.append(nt)
-                
-        processing_time = time.time() - start_time
-        return final_triples, total_prompt_tokens, total_completion_tokens, processing_time
-
-    def _find_contradiction(
-        self, 
-        new_t: KnowledgeTriple, 
-        existing_list: List[KnowledgeTriple]
-    ) -> Optional[KnowledgeTriple]:
-        """
-        Check if a new triple contradicts any existing triples.
-        
-        Args:
-            new_t: New triple to check
-            existing_list: List of existing triples
-            
-        Returns:
-            The conflicting triple if found, None otherwise
-        """
-        # Define opposite relation pairs (bidirectional)
-        opposite_relations = {
-            ("treats", "causes"),
-            ("inhibits", "activates"),
-            ("increases", "decreases"),
-            ("upregulates", "downregulates")
-        }
-        
-        # Create a set of relation pairs that are opposites
-        contradiction_pairs = set()
-        for a, b in opposite_relations:
-            contradiction_pairs.add((a, b))
-            contradiction_pairs.add((b, a))  # Add reverse pair too
-
-        for ex in existing_list:
-            # Check for triples about the same entities but with potentially opposing relations
-            if (ex.head.lower() == new_t.head.lower() and 
-                ex.tail.lower() == new_t.tail.lower()):
-                # Check if relation pair is an opposite
-                if (ex.relation, new_t.relation) in contradiction_pairs:
-                    return ex
-        return None
-
-    def _resolve_contradiction(self, new_triple: KnowledgeTriple, existing_triple: KnowledgeTriple) -> Tuple[bool, int, int, float]:
-        """
-        LLM-based evaluation to decide which of two contradicting triples to keep.
-        
-        Args:
-            new_triple: New triple being evaluated
-            existing_triple: Existing conflicting triple
-            
-        Returns:
-            Tuple of (keep_decision, prompt_tokens, completion_tokens, processing_time)
-        """
-        prompt = f"""
-        We have two potentially contradicting biomedical statements:
-        
-        NEW: {new_triple.head} -> {new_triple.relation} -> {new_triple.tail}
-        EXISTING: {existing_triple.head} -> {existing_triple.relation} -> {existing_triple.tail}
-        
-        Analyze these statements and decide:
-        1. Do they truly contradict each other, or could both be valid in different contexts?
-        2. Which statement appears more credible based on biological knowledge?
-        
-        Return one of:
-        - "KEEP_NEW" if the new statement should replace or complement the existing one
-        - "KEEP_EXISTING" if the existing statement is more reliable
-        - "KEEP_BOTH" if they can coexist (different contexts, conditions, etc.)
-        - "REVIEW" if expert human review is needed due to high uncertainty
-        
-        Provide only the decision code with no additional text.
-        """
-        
         start_time = time.time()
         try:
             response = self.client.chat.completions.create(
@@ -1310,199 +1122,129 @@ This is incorrect because it fails to recognize the direct contradiction between
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=4096,
                 temperature=0.1
             )
-            
-            decision = response.choices[0].message.content.strip().upper()
+
+            content = response.choices[0].message.content.strip()
             prompt_tokens = response.usage.prompt_tokens
             completion_tokens = response.usage.completion_tokens
             processing_time = time.time() - start_time
-            
-            # Parse the decision
-            keep_new = decision in ["KEEP_NEW", "KEEP_BOTH"]
-            
-            return keep_new, prompt_tokens, completion_tokens, processing_time
-            
-        except Exception as e:
-            logger.warning(f"Conflict resolution failed. Error: {e}")
-            # Default to keeping existing knowledge when uncertain
-            return False, 0, 0, time.time() - start_time
 
-class EvaluatorAgent:
+            try:
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                versions = data.get("versions", [])
+
+                for i, triple in enumerate(triples):
+                    if i < len(versions):
+                        v = versions[i]
+                        triple.introduced_version = v.get("introduced_version", "")
+                        triple.valid_version_range = v.get("valid_range", "unknown")
+
+                    # If document has a detected version and no specific version found,
+                    # use document version as reference
+                    if not triple.introduced_version and detected_version:
+                        triple.valid_version_range = f"{detected_version}+"
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse version JSON")
+                # Default: use document version if available
+                for triple in triples:
+                    if detected_version:
+                        triple.valid_version_range = f"{detected_version}+"
+
+            return triples, prompt_tokens, completion_tokens, processing_time
+
+        except Exception as e:
+            logger.error(f"Version resolution failed: {str(e)}")
+            return triples, 0, 0, time.time() - start_time
+
+
+class ChangeDetectionAgent:
     """
-    Evaluator Agent (EA):
-    1) Aggregates various confidence signals
-    2) Produces a final integration score for each triple
-    3) Evaluates clarity and relevance in addition to confidence
+    Detects changes from release notes and update documents.
+
+    Identifies:
+    - New features/UI added
+    - Removed features/UI
+    - Changed/moved/renamed items
+    - Bug fixes affecting known limitations
     """
-    def __init__(self, client: OpenAI, model_name: str, integrate_threshold=0.6):
-        """
-        Initialize the Evaluator Agent.
-        
-        Args:
-            client: OpenAI client instance
-            model_name: LLM model identifier
-            integrate_threshold: Minimum score to integrate knowledge
-        """
+
+    def __init__(self, client: OpenAI, model_name: str):
         self.client = client
         self.model_name = model_name
-        self.integrate_threshold = integrate_threshold
-        self.system_prompt = """You are the Evaluator Agent (EA). After extraction, alignment, and conflict resolution, each candidate triplet has multiple verification scores. Your duty is to aggregate these signals into final confidence, clarity, and relevance scores and decide whether to integrate each triplet into the KG.
+        self.system_prompt = """You are a Change Detection Agent for software update documents.
 
-For CONFIDENCE evaluation:
-- Assess the factual correctness of the triple based on biomedical knowledge
-- Consider the source reliability and extraction confidence
-- Account for any conflict resolution outcomes
+Your job is to extract structured change information from release notes, changelogs, and "What's New" documents.
 
-For CLARITY evaluation:
-- Determine how unambiguous and well-defined the entities and relation are
-- Check for vague terms or imprecise relationship descriptions
-- Assess whether the triple would be interpretable to domain experts
+Change Types:
+- added: New feature, UI element, or capability introduced
+- removed: Feature, UI element deprecated or removed
+- changed: Behavior or functionality modified
+- moved: UI element relocated to different location
+- renamed: Feature or UI element given a new name
+- fixed: Bug fix that might affect known limitations
 
-For RELEVANCE evaluation:
-- Evaluate how important and appropriate the triple is for the knowledge graph
-- Consider whether it aligns with the domain focus
-- Assess its potential utility for downstream applications
+For each change, extract:
+1. change_type: One of [added, removed, changed, moved, renamed, fixed]
+2. entity_name: What was changed
+3. entity_type: Type of entity (Feature, UIElement, Setting, etc.)
+4. old_value: Previous state (for changed/moved/renamed)
+5. new_value: New state (for changed/moved/renamed)
+6. description: Details about the change
 
 POSITIVE EXAMPLE:
-Input: {
-  "triple": {"head": "Metformin", "relation": "decreases", "tail": "blood glucose levels"}
-}
-Output: {
-  "confidence": 0.95,
-  "clarity": 0.90,
-  "relevance": 0.85,
-  "rationale": "Well-established mechanism of action for this first-line antidiabetic drug. The entities and relationship are clearly defined. Highly relevant for a biomedical knowledge graph."
-}
+Input: "What's New in Photoshop 2024:
+- NEW: Generative Fill - AI-powered content generation
+- IMPROVED: The Healing Brush has moved from the toolbar to the new Contextual Toolbar
+- REMOVED: Legacy Save for Web dialog (use Export As instead)
+- FIXED: Selection tools now work correctly with rotated canvases"
 
-NEGATIVE EXAMPLE:
-Input: {
-  "triple": {"head": "Drug X", "relation": "may influence", "tail": "some cellular processes"}
-}
 Output: {
-  "confidence": 0.85,
-  "clarity": 0.40,
-  "relevance": 0.30,
-  "rationale": "The relationship is vaguely defined with uncertain terms. The entities lack specificity. Limited utility in a biomedical knowledge graph."
+  "changes": [
+    {"change_type": "added", "entity_name": "Generative Fill", "entity_type": "Feature", "old_value": "", "new_value": "", "description": "AI-powered content generation"},
+    {"change_type": "moved", "entity_name": "Healing Brush", "entity_type": "UIElement", "old_value": "toolbar", "new_value": "Contextual Toolbar", "description": "Relocated to new contextual toolbar"},
+    {"change_type": "removed", "entity_name": "Save for Web dialog", "entity_type": "UIElement", "old_value": "", "new_value": "Export As", "description": "Legacy dialog removed, replaced by Export As"},
+    {"change_type": "fixed", "entity_name": "Selection tools", "entity_type": "Feature", "old_value": "Did not work with rotated canvases", "new_value": "Works correctly with rotated canvases", "description": "Bug fix for rotated canvas selection"}
+  ],
+  "version": "2024"
 }
 """
 
-    def finalize_triples(self, candidate_triples: List[KnowledgeTriple]) -> Tuple[List[KnowledgeTriple], int, int, float]:
+    def detect_changes(self, text: str) -> Tuple[List[ChangeRecord], str, int, int, float]:
         """
-        Evaluate and filter triples based on confidence, clarity, and relevance.
-        
+        Extract changes from release notes.
+
         Args:
-            candidate_triples: Triples to evaluate
-            
+            text: Release notes text
+
         Returns:
-            Tuple of (integrated_triples, prompt_tokens, completion_tokens, processing_time)
+            Tuple of (change_list, version, prompt_tokens, completion_tokens, processing_time)
         """
-        start_time = time.time()
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        
-        integrated_triples = []
-        for i, triple in enumerate(candidate_triples):
-            # Evaluate confidence, clarity, and relevance if missing
-            if triple.confidence < 0.01:
-                conf, conf_pt, conf_ct, _ = self._evaluate_confidence(triple)
-                triple.confidence = conf
-                total_prompt_tokens += conf_pt
-                total_completion_tokens += conf_ct
-                
-            if triple.clarity < 0.01:
-                clarity, clar_pt, clar_ct, _ = self._evaluate_clarity(triple)
-                triple.clarity = clarity
-                total_prompt_tokens += clar_pt
-                total_completion_tokens += clar_ct
-                
-            if triple.relevance < 0.01:
-                relevance, rel_pt, rel_ct, _ = self._evaluate_relevance(triple)
-                triple.relevance = relevance
-                total_prompt_tokens += rel_pt
-                total_completion_tokens += rel_ct
-            
-            # Compute final integration score
-            integration_score = self._aggregate_scores(triple)
-            
-            # Keep triple if score meets threshold
-            if integration_score >= self.integrate_threshold:
-                integrated_triples.append(triple)
-        
-        processing_time = time.time() - start_time
-        return integrated_triples, total_prompt_tokens, total_completion_tokens, processing_time
+        prompt = f"""Extract all changes from this release notes / changelog document.
 
-    def _aggregate_scores(self, triple: KnowledgeTriple) -> float:
-        """
-        Combine confidence metrics into final score.
-        
-        Args:
-            triple: Triple to score
-            
-        Returns:
-            Aggregated confidence score
-        """
-        # Weighting factors for different metrics (customizable)
-        w_conf, w_clarity, w_rel = 0.5, 0.25, 0.25
-        
-        # Ensure all scores are in [0.0, 1.0] range
-        conf = max(0.0, min(1.0, triple.confidence))
-        clarity = max(0.0, min(1.0, triple.clarity))
-        relevance = max(0.0, min(1.0, triple.relevance))
-        
-        # Weighted average
-        return (
-            w_conf * conf +
-            w_clarity * clarity +
-            w_rel * relevance
-        )
+Document:
+{text}
 
-    def _evaluate_confidence(self, triple: KnowledgeTriple) -> Tuple[float, int, int, float]:
-        """
-        LLM-based evaluation of triple confidence.
-        
-        Args:
-            triple: Triple to evaluate
-            
-        Returns:
-            Tuple of (confidence_score, prompt_tokens, completion_tokens, processing_time)
-        """
-        prompt = f"""
-        Evaluate the factual confidence of this biomedical statement:
-        "{triple.head} -> {triple.relation} -> {triple.tail}"
+Return a JSON object with:
+- changes: Array of change records
+- version: The version these changes apply to
 
-        I need you to assess how confident we can be that this relationship is scientifically accurate based on established biomedical knowledge.
-        
-        Consider factors like:
-        1. Is this a well-established scientific fact?
-        2. Is there substantial evidence in the literature supporting this claim?
-        3. Would biomedical experts broadly agree with this statement?
-        4. Does it align with current scientific understanding?
-        
-        Rate your confidence from 0.0 (completely uncertain) to 1.0 (extremely confident).
-        Return only a single float value between 0.0 and 1.0.
-        
-        Example ratings:
-        - 0.95-0.99: Well-established scientific facts with overwhelming evidence
-        - 0.80-0.94: Strong scientific consensus with substantial supporting evidence
-        - 0.60-0.79: Reasonably supported claims with some evidence base
-        - 0.40-0.59: Mixed evidence or emerging hypotheses
-        - 0.20-0.39: Limited evidence, preliminary findings
-        - 0.01-0.19: Very weak evidence, highly speculative
+Each change should have:
+- change_type: One of [added, removed, changed, moved, renamed, fixed]
+- entity_name: What was changed
+- entity_type: One of [Feature, UIElement, Setting, Shortcut, FileFormat, Concept]
+- old_value: Previous state (empty for added)
+- new_value: New state (empty for removed, or replacement for removed items)
+- description: Details
 
-        POSITIVE EXAMPLES:
-        - "Metformin -> decreases -> blood glucose levels" = 0.97
-        - "Statins -> inhibit -> HMG-CoA reductase" = 0.95
-        - "Insulin resistance -> contributes to -> type 2 diabetes" = 0.93
+Return only valid JSON."""
 
-        NEGATIVE EXAMPLES:
-        - "Vitamin C -> cures -> cancer" = 0.12
-        - "Unknown compound -> may affect -> some pathways" = 0.25
-        
-        Return only the numeric value as a float between 0.0 and 1.0.
-        """
-        
         start_time = time.time()
         try:
             response = self.client.chat.completions.create(
@@ -1511,254 +1253,316 @@ Output: {
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=4096,
-                temperature=0.0
+                temperature=0.1
             )
-            
+
             content = response.choices[0].message.content.strip()
             prompt_tokens = response.usage.prompt_tokens
             completion_tokens = response.usage.completion_tokens
             processing_time = time.time() - start_time
-            
-            # Extract float value
-            score = self._extract_float_score(content)
-            return score, prompt_tokens, completion_tokens, processing_time
-            
-        except Exception as e:
-            logger.warning(f"Confidence evaluation failed. Error: {e}")
-            return 0.5, 0, 0, time.time() - start_time
 
-    def _evaluate_clarity(self, triple: KnowledgeTriple) -> Tuple[float, int, int, float]:
-        """
-        LLM-based evaluation of triple linguistic clarity.
-        
-        Args:
-            triple: Triple to evaluate
-            
-        Returns:
-            Tuple of (clarity_score, prompt_tokens, completion_tokens, processing_time)
-        """
-        prompt = f"""
-        Evaluate the clarity and specificity of this biomedical relationship:
-        "{triple.head} -> {triple.relation} -> {triple.tail}"
+            changes = []
+            version = ""
 
-        Assess how clear, specific, and unambiguous this statement is to biomedical experts.
-        
-        Consider these aspects:
-        1. Are the entities precise and unambiguous? (e.g., "ACE inhibitors" is clearer than "some drugs")
-        2. Is the relationship type specific and well-defined? (e.g., "inhibits" is clearer than "affects")
-        3. Would biomedical experts interpret this statement consistently?
-        4. Are there any vague terms or imprecise language that reduce clarity?
-        5. Does the statement avoid unnecessary hedging words (e.g., "may", "possibly", "might")?
-        
-        Rate clarity from 0.0 (very ambiguous) to 1.0 (perfectly clear).
-        Return only a single float value between 0.0 and 1.0.
-        
-        Example ratings:
-        - 0.95-0.99: Crystal clear, highly specific statements with no ambiguity
-        - 0.80-0.94: Very clear statements with minor room for interpretation
-        - 0.60-0.79: Mostly clear statements with some potential ambiguity
-        - 0.40-0.59: Statements with moderate ambiguity or vagueness
-        - 0.20-0.39: Significantly vague or ambiguous statements
-        - 0.01-0.19: Extremely vague statements with minimal specificity
-
-        POSITIVE EXAMPLES:
-        - "Atorvastatin -> inhibits -> HMG-CoA reductase" = 0.95
-        - "Aspirin -> irreversibly inhibits -> cyclooxygenase-1" = 0.97
-        - "TNF-alpha -> induces -> apoptosis in tumor cells" = 0.85
-
-        NEGATIVE EXAMPLES:
-        - "Some medicines -> may affect -> various biological processes" = 0.20
-        - "Drug X -> possibly influences -> certain cellular pathways" = 0.35
-        
-        Return only the numeric value as a float between 0.0 and 1.0.
-        """
-        
-        start_time = time.time()
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You evaluate clarity of biomedical relationships."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=4096,
-                temperature=0.0
-            )
-            
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
-            processing_time = time.time() - start_time
-            
-            # Extract float value
-            score = self._extract_float_score(content)
-            return score, prompt_tokens, completion_tokens, processing_time
-            
-        except Exception as e:
-            logger.warning(f"Clarity evaluation failed. Error: {e}")
-            return 0.5, 0, 0, time.time() - start_time
-
-    def _evaluate_relevance(self, triple: KnowledgeTriple, domain="biomedical") -> Tuple[float, int, int, float]:
-        """
-        LLM-based evaluation of triple domain relevance.
-        
-        Args:
-            triple: Triple to evaluate
-            domain: Domain topic for relevance
-            
-        Returns:
-            Tuple of (relevance_score, prompt_tokens, completion_tokens, processing_time)
-        """
-        prompt = f"""
-        Evaluate how relevant this relationship is to the {domain} domain:
-        "{triple.head} -> {triple.relation} -> {triple.tail}"
-
-        Assess how important and appropriate this statement is for inclusion in a specialized {domain} knowledge graph.
-        
-        Consider these aspects:
-        1. Is this directly relevant to {domain} research or practice?
-        2. Does this provide valuable information to {domain} experts?
-        3. Would this knowledge be useful for {domain} applications (research, clinical practice, drug discovery, etc.)?
-        4. Is this specialized knowledge rather than general world knowledge?
-        5. Does it align with the core interests of the {domain} field?
-        
-        Rate relevance from 0.0 (completely irrelevant) to 1.0 (highly relevant).
-        Return only a single float value between 0.0 and 1.0.
-        
-        Example ratings:
-        - 0.95-0.99: Core {domain} knowledge essential to the field
-        - 0.80-0.94: Highly relevant information for {domain} specialists
-        - 0.60-0.79: Moderately relevant information with clear applications
-        - 0.40-0.59: Somewhat relevant but not central to the domain
-        - 0.20-0.39: Marginally relevant information
-        - 0.01-0.19: Largely irrelevant to the {domain} domain
-
-        POSITIVE EXAMPLES:
-        - "Metformin -> decreases -> insulin resistance" = 0.95
-        - "BRCA1 mutation -> increases risk of -> breast cancer" = 0.97
-        - "Tumor necrosis factor -> stimulates -> inflammatory response" = 0.90
-
-        NEGATIVE EXAMPLES:
-        - "William Shakespeare -> wrote -> Hamlet" = 0.05 (literature knowledge, not biomedical)
-        - "Earth -> orbits -> Sun" = 0.01 (general knowledge, not specialized)
-        - "Company X -> manufactures -> medical devices" = 0.30 (business information, not core biomedical knowledge)
-        
-        Return only the numeric value as a float between 0.0 and 1.0.
-        """
-        
-        start_time = time.time()
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": f"You evaluate {domain} relevance of relationships."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=4096,
-                temperature=0.0
-            )
-            
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
-            processing_time = time.time() - start_time
-            
-            # Extract float value
-            score = self._extract_float_score(content)
-            return score, prompt_tokens, completion_tokens, processing_time
-            
-        except Exception as e:
-            logger.warning(f"Relevance evaluation failed. Error: {e}")
-            return 0.5, 0, 0, time.time() - start_time
-
-    def _extract_float_score(self, content: str) -> float:
-        """
-        Extract a float value from LLM response.
-        
-        Args:
-            content: Text containing float value(s)
-            
-        Returns:
-            Parsed and normalized float value in [0.0, 1.0]
-        """
-        # Look for float numbers in the content
-        import re
-        float_matches = re.findall(r"[-+]?\d*\.\d+|\d+", content)
-        if float_matches:
             try:
-                score = float(float_matches[0])
-                # Clamp to [0.0, 1.0]
-                return max(0.0, min(1.0, score))
-            except ValueError:
-                pass
-        
-        # Default fallback
-        return 0.5
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                version = data.get("version", "")
+                change_list = data.get("changes", [])
+
+                type_mapping = {
+                    "Feature": EntityType.FEATURE,
+                    "UIElement": EntityType.UI_ELEMENT,
+                    "Setting": EntityType.SETTING,
+                    "Shortcut": EntityType.SHORTCUT,
+                    "FileFormat": EntityType.FILE_FORMAT,
+                    "Concept": EntityType.CONCEPT
+                }
+
+                for c in change_list:
+                    change = ChangeRecord(
+                        change_type=c.get("change_type", "changed"),
+                        entity_name=c.get("entity_name", ""),
+                        entity_type=type_mapping.get(c.get("entity_type", ""), EntityType.UNKNOWN),
+                        old_value=c.get("old_value", ""),
+                        new_value=c.get("new_value", ""),
+                        version=version,
+                        description=c.get("description", "")
+                    )
+                    if change.entity_name:
+                        changes.append(change)
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse changes JSON")
+
+            return changes, version, prompt_tokens, completion_tokens, processing_time
+
+        except Exception as e:
+            logger.error(f"Change detection failed: {str(e)}")
+            return [], "", 0, 0, time.time() - start_time
+
+
+class ImpactAnalysisAgent:
+    """
+    Analyzes impact of changes on existing knowledge graph.
+
+    Identifies:
+    - Triples affected by changes
+    - Procedures that need updating
+    - Deprecated knowledge
+    """
+
+    def __init__(self, client: OpenAI, model_name: str):
+        self.client = client
+        self.model_name = model_name
+        self.system_prompt = """You are an Impact Analysis Agent for knowledge graph maintenance.
+
+Your job is to analyze how software changes affect existing knowledge.
+
+Given:
+1. A list of changes (added, removed, moved, renamed features)
+2. Existing knowledge triples
+
+Determine:
+1. Which triples are DEPRECATED (no longer valid due to removals)
+2. Which triples need UPDATING (due to moves, renames, changes)
+3. Which triples are UNAFFECTED
+
+For deprecated/updated triples, explain why and suggest resolution.
+
+POSITIVE EXAMPLE:
+Change: {"type": "moved", "entity": "Healing Brush", "old": "Toolbar", "new": "Contextual Toolbar"}
+Existing Triple: "Healing Brush" -[located_in]-> "Toolbar"
+
+Analysis: {
+  "affected_triples": [
+    {
+      "triple": "Healing Brush -[located_in]-> Toolbar",
+      "impact": "deprecated",
+      "reason": "Healing Brush moved to Contextual Toolbar",
+      "suggested_update": "Healing Brush -[located_in]-> Contextual Toolbar"
+    }
+  ]
+}
+"""
+
+    def analyze_impact(self, changes: List[ChangeRecord], existing_triples: List[UsageKnowledgeTriple]) -> Tuple[List[Dict], int, int, float]:
+        """
+        Analyze impact of changes on existing knowledge.
+
+        Args:
+            changes: List of detected changes
+            existing_triples: Existing knowledge graph triples
+
+        Returns:
+            Tuple of (impact_list, prompt_tokens, completion_tokens, processing_time)
+        """
+        if not changes or not existing_triples:
+            return [], 0, 0, 0.0
+
+        changes_desc = "\n".join([
+            f"- {c.change_type.upper()}: {c.entity_name} ({c.entity_type.value})"
+            + (f" from '{c.old_value}' to '{c.new_value}'" if c.old_value or c.new_value else "")
+            + (f" - {c.description}" if c.description else "")
+            for c in changes
+        ])
+
+        triples_desc = "\n".join([f"- {t}" for t in existing_triples[:50]])  # Limit for context
+
+        prompt = f"""Analyze how these changes affect the existing knowledge triples.
+
+Changes in this update:
+{changes_desc}
+
+Existing knowledge triples:
+{triples_desc}
+
+For each affected triple, provide:
+- triple_index: Index in the triples list (0-based)
+- impact: One of [deprecated, needs_update, unaffected]
+- reason: Why it's affected
+- suggested_update: New triple if needs_update, or empty
+
+Return JSON: {{"affected_triples": [...]}}
+Only include triples that are deprecated or need updates.
+Return only valid JSON."""
+
+        start_time = time.time()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+
+            content = response.choices[0].message.content.strip()
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+            processing_time = time.time() - start_time
+
+            affected = []
+            try:
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0]
+
+                data = json.loads(content)
+                affected = data.get("affected_triples", [])
+
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse impact analysis JSON")
+
+            return affected, prompt_tokens, completion_tokens, processing_time
+
+        except Exception as e:
+            logger.error(f"Impact analysis failed: {str(e)}")
+            return [], 0, 0, time.time() - start_time
+
+
+class KnowledgeIntegrationAgent:
+    """
+    Integrates new knowledge into the existing knowledge graph.
+
+    Handles:
+    - Deduplication
+    - Conflict resolution
+    - Merging related entities
+    """
+
+    def __init__(self, client: OpenAI, model_name: str):
+        self.client = client
+        self.model_name = model_name
+        self.system_prompt = """You are a Knowledge Integration Agent for software knowledge graphs.
+
+Your job is to integrate new knowledge while maintaining consistency:
+
+1. DEDUPLICATION: Identify when new entities/triples are duplicates of existing ones
+   - Same entity with different names (aliases)
+   - Same relationship expressed differently
+
+2. CONFLICT RESOLUTION: When new knowledge conflicts with existing:
+   - Version-specific: Both can be true in different versions
+   - Correction: New knowledge supersedes old (with reason)
+   - Ambiguous: Flag for human review
+
+3. MERGING: Combine related information
+   - Add aliases to existing entities
+   - Merge partial procedure descriptions
+   - Link related concepts
+
+Guidelines:
+- Prefer keeping both if they could be version-specific
+- Prefer newer source if dates are known
+- Flag for review if confidence is low
+"""
+
+    def integrate_triples(self, new_triples: List[UsageKnowledgeTriple], existing_triples: List[UsageKnowledgeTriple]) -> Tuple[List[UsageKnowledgeTriple], List[UsageKnowledgeTriple], int, int, float]:
+        """
+        Integrate new triples with existing knowledge.
+
+        Args:
+            new_triples: New triples to integrate
+            existing_triples: Existing knowledge graph
+
+        Returns:
+            Tuple of (triples_to_add, triples_to_flag, prompt_tokens, completion_tokens, processing_time)
+        """
+        if not new_triples:
+            return [], [], 0, 0, 0.0
+
+        # Simple deduplication first (exact matches)
+        existing_set = set()
+        for t in existing_triples:
+            key = f"{t.head.lower()}|{t.relation}|{t.tail.lower()}"
+            existing_set.add(key)
+
+        unique_new = []
+        for t in new_triples:
+            key = f"{t.head.lower()}|{t.relation}|{t.tail.lower()}"
+            if key not in existing_set:
+                unique_new.append(t)
+                existing_set.add(key)  # Prevent duplicates within new_triples
+
+        # For now, simple integration without LLM (can be enhanced)
+        # All unique triples are added, none flagged
+        return unique_new, [], 0, 0, 0.0
+
 
 ##############################################################################
-# The KARMA Pipeline Class
+# Main Pipeline Class
 ##############################################################################
 
 class KARMA:
     """
-    KARMA: Knowledge Agent for Relationship and Meta-data Acquisition
-    
-    A multi-agent pipeline that orchestrates:
-    1) Ingestion -> 2) Reading -> 3) Summarization -> 4) Entity Extraction
-    -> 5) Relationship Extraction -> 6) Schema Alignment
-    -> 7) Conflict Resolution -> 8) Evaluation -> Integration
+    KARMA: Knowledge Agent for Software Usage Documentation
+
+    A multi-agent pipeline that extracts structured knowledge from software
+    documentation to build a versioned knowledge graph.
+
+    Pipeline stages:
+    1. Document Classification
+    2. Entity Extraction (UI elements, features, concepts)
+    3. Procedure Extraction
+    4. Relationship Extraction
+    5. Version Resolution
+    6. Knowledge Integration
+
+    For updates/maintenance:
+    - Change Detection (from release notes)
+    - Impact Analysis
+    - Deprecation and Update
     """
+
     def __init__(self, api_key: str, base_url: str = None, model_name: str = "gpt-4o"):
         """
-        Initialize KARMA pipeline with API credentials.
-        
+        Initialize KARMA pipeline.
+
         Args:
             api_key: OpenAI API key
-            base_url: Optional API base URL for Azure or custom endpoints
+            base_url: Optional API base URL
             model_name: Model identifier
         """
-        # Initialize OpenAI client
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
-        
+
         self.client = OpenAI(**client_kwargs)
         self.model_name = model_name
-        
-        # Initialize all agent classes
-        self.ingestion_agent = IngestionAgent(self.client, model_name)
-        self.reader_agent = ReaderAgent(self.client, model_name)
-        self.summarizer_agent = SummarizerAgent(self.client, model_name)
-        self.entity_ex_agent = EntityExtractionAgent(self.client, model_name)
-        self.relation_ex_agent = RelationshipExtractionAgent(self.client, model_name)
-        self.schema_agent = SchemaAlignmentAgent(self.client, model_name)
-        self.conflict_agent = ConflictResolutionAgent(self.client, model_name)
-        self.evaluator_agent = EvaluatorAgent(self.client, model_name, integrate_threshold=0.6)
 
-        # Internally stored knowledge graph representation
+        # Initialize agents
+        self.doc_classifier = DocumentClassifierAgent(self.client, model_name)
+        self.ui_extractor = UIElementExtractionAgent(self.client, model_name)
+        self.feature_extractor = FeatureExtractionAgent(self.client, model_name)
+        self.procedure_extractor = ProcedureExtractionAgent(self.client, model_name)
+        self.relationship_extractor = RelationshipExtractionAgent(self.client, model_name)
+        self.version_resolver = VersionResolutionAgent(self.client, model_name)
+        self.change_detector = ChangeDetectionAgent(self.client, model_name)
+        self.impact_analyzer = ImpactAnalysisAgent(self.client, model_name)
+        self.integrator = KnowledgeIntegrationAgent(self.client, model_name)
+
+        # Knowledge graph storage
         self.knowledge_graph = {
-            "entities": set(),       # set of string IDs or entity names
-            "triples": []            # list of KnowledgeTriple objects
+            "entities": {},      # entity_id -> SoftwareEntity
+            "triples": [],       # List of UsageKnowledgeTriple
+            "procedures": {},    # procedure_id -> Procedure
+            "software": "",      # Primary software name
+            "versions": set()    # Known versions
         }
 
-        # Logging and tracking
+        # Tracking
         self.output_log: List[str] = []
         self.intermediate = IntermediateOutput()
 
-    ##########################################################################
-    # Helper: PDF reading
-    ##########################################################################
     def _read_pdf(self, pdf_path: str) -> str:
-        """
-        Extract raw text from a PDF file.
-        
-        Args:
-            pdf_path: Path to PDF file
-            
-        Returns:
-            Extracted text content
-        """
+        """Extract text from PDF file."""
         try:
             text = ""
             with open(pdf_path, 'rb') as f:
@@ -1771,287 +1575,514 @@ class KARMA:
             return ""
 
     def _log(self, message: str):
-        """
-        Simple logger for storing pipeline messages.
-        
-        Args:
-            message: Log message to store
-        """
+        """Log pipeline message."""
         logger.info(message)
         self.output_log.append(message)
 
-    ##########################################################################
-    # The Main Pipeline
-    ##########################################################################
-    def process_document(self, source: Union[str, os.PathLike], domain: str = "biomedical") -> List[KnowledgeTriple]:
+    def _segment_text(self, text: str, max_length: int = 2000) -> List[str]:
+        """Split text into manageable segments."""
+        paragraphs = text.split("\n\n")
+        segments = []
+        current_segment = ""
+
+        for para in paragraphs:
+            if len(current_segment) + len(para) < max_length:
+                current_segment += para + "\n\n"
+            else:
+                if current_segment.strip():
+                    segments.append(current_segment.strip())
+                current_segment = para + "\n\n"
+
+        if current_segment.strip():
+            segments.append(current_segment.strip())
+
+        return segments if segments else [text[:max_length]]
+
+    def process_document(self, source: Union[str, os.PathLike]) -> Dict:
         """
-        Pipeline entry point to process a document and extract knowledge.
-        
-        If `source` ends with '.pdf', we assume it is a PDF file path;
-        otherwise, treat `source` as raw text input.
-        
+        Process a document and extract knowledge.
+
+        Main entry point for knowledge extraction.
+
         Args:
             source: Text content or path to PDF file
-            domain: Domain context for relevance scoring
-            
+
         Returns:
-            List of integrated KnowledgeTriple objects
+            Dict with extraction results
         """
         total_prompt_tokens = 0
         total_completion_tokens = 0
-        total_time = 0
-        pipeline_start_time = time.time()
-        
-        # Handle various input types
+        pipeline_start = time.time()
+
+        # Handle input
         if isinstance(source, str) and source.lower().endswith('.pdf'):
             raw_text = self._read_pdf(source)
         elif isinstance(source, os.PathLike) and str(source).lower().endswith('.pdf'):
             raw_text = self._read_pdf(str(source))
         else:
-            # treat source directly as text
             raw_text = source
-            
+
         self.intermediate.raw_text = raw_text
-        
-        # === (1) Ingestion ===
-        step_start = time.time()
-        doc_dict = self.ingestion_agent.ingest_document(raw_text)
-        step_time = time.time() - step_start
-        total_time += step_time
-        self._log(f"[1] Ingestion completed in {step_time:.2f}s. Document standardized.")
 
-        # === (2) Reader: Segment + Score Relevance ===
-        step_start = time.time()
-        segments = self.reader_agent.split_into_segments(doc_dict["content"])
-        self.intermediate.segments = segments
-        
-        relevant_content = []
-        for seg in segments:
-            score, prompt_tokens, completion_tokens, processing_time = self.reader_agent.score_relevance(seg)
-            total_prompt_tokens += prompt_tokens
-            total_completion_tokens += completion_tokens
-            total_time += processing_time
-            if score > 0.2:  # Keep only segments with relevance above threshold
-                relevant_content.append(seg)
-        
-        self.intermediate.relevant_segments = relevant_content
-        step_time = time.time() - step_start
-        self._log(f"[2] Reader completed in {step_time:.2f}s. Total segments: {len(segments)}, relevant: {len(relevant_content)}")
+        # === Stage 1: Document Classification ===
+        self._log("[1/6] Classifying document...")
+        classification, pt, ct, _ = self.doc_classifier.classify_document(raw_text)
+        total_prompt_tokens += pt
+        total_completion_tokens += ct
 
-        # === (3) Summarizer ===
-        step_start = time.time()
-        summaries = []
-        for seg in relevant_content:
-            summary, prompt_tokens, completion_tokens, processing_time = self.summarizer_agent.summarize_segment(seg)
-            total_prompt_tokens += prompt_tokens
-            total_completion_tokens += completion_tokens
-            total_time += processing_time
-            summaries.append(summary)
-        
-        self.intermediate.summaries = summaries
-        step_time = time.time() - step_start
-        self._log(f"[3] Summarizer completed in {step_time:.2f}s. Summaries produced: {len(summaries)}")
+        doc_type = DocumentType(classification.get("document_type", "unknown"))
+        software = classification.get("software", "Unknown")
+        version = classification.get("version", "")
 
-        # === (4) Entity Extraction ===
-        step_start = time.time()
-        all_entities: List[KGEntity] = []
-        for summary in summaries:
-            extracted, prompt_tokens, completion_tokens, processing_time = self.entity_ex_agent.extract_entities(summary)
-            total_prompt_tokens += prompt_tokens
-            total_completion_tokens += completion_tokens
-            total_time += processing_time
-            all_entities.extend(extracted)
-        
-        # Deduplicate entities by name (case-insensitive)
-        unique_entities_map = {}
-        for ent in all_entities:
-            unique_entities_map[ent.name.lower()] = ent
-        all_entities = list(unique_entities_map.values())
-        
+        self.intermediate.document_type = doc_type
+        self.intermediate.detected_software = software
+        self.intermediate.detected_version = version
+        self.knowledge_graph["software"] = software
+        if version:
+            self.knowledge_graph["versions"].add(version)
+
+        self._log(f"    Document type: {doc_type.value}, Software: {software}, Version: {version}")
+
+        # Check if this is release notes (use update workflow)
+        if doc_type == DocumentType.RELEASE_NOTES:
+            return self.process_update_document(raw_text, version)
+
+        # === Stage 2: Segment and Extract ===
+        segments = self._segment_text(raw_text)
+        self.intermediate.segments = [{"text": s} for s in segments]
+        self._log(f"[2/6] Processing {len(segments)} text segments...")
+
+        all_entities: List[SoftwareEntity] = []
+        all_procedures: List[Procedure] = []
+
+        for i, segment in enumerate(segments):
+            # Extract UI elements
+            ui_entities, pt, ct, _ = self.ui_extractor.extract_ui_elements(segment, software)
+            total_prompt_tokens += pt
+            total_completion_tokens += ct
+            all_entities.extend(ui_entities)
+
+            # Extract features and concepts
+            feature_entities, pt, ct, _ = self.feature_extractor.extract_features(segment, software)
+            total_prompt_tokens += pt
+            total_completion_tokens += ct
+            all_entities.extend(feature_entities)
+
+            # Extract procedures
+            procedures, pt, ct, _ = self.procedure_extractor.extract_procedures(segment, software)
+            total_prompt_tokens += pt
+            total_completion_tokens += ct
+            all_procedures.extend(procedures)
+
+        # Deduplicate entities
+        entity_map = {}
+        for e in all_entities:
+            key = e.name.lower()
+            if key not in entity_map:
+                entity_map[key] = e
+        all_entities = list(entity_map.values())
+
         self.intermediate.entities = all_entities
-        step_time = time.time() - step_start
-        self._log(f"[4] Entity Extraction completed in {step_time:.2f}s. Unique entities found: {len(all_entities)}")
+        self.intermediate.procedures = all_procedures
+        self._log(f"    Extracted {len(all_entities)} entities, {len(all_procedures)} procedures")
 
-        # === (5) Relationship Extraction ===
-        step_start = time.time()
-        all_relationships: List[KnowledgeTriple] = []
-        for summary in summaries:
-            new_trips, prompt_tokens, completion_tokens, processing_time = self.relation_ex_agent.extract_relationships(summary, all_entities)
-            total_prompt_tokens += prompt_tokens
-            total_completion_tokens += completion_tokens
-            total_time += processing_time
-            all_relationships.extend(new_trips)
-            
-        # Deduplicate relationships (exact matches only)
-        unique_rel_map = {}
-        for rel in all_relationships:
-            key = f"{rel.head.lower()}__{rel.relation.lower()}__{rel.tail.lower()}"
-            # Keep the one with higher confidence if duplicates exist
-            if key not in unique_rel_map or rel.confidence > unique_rel_map[key].confidence:
-                unique_rel_map[key] = rel
-        all_relationships = list(unique_rel_map.values())
-        
-        self.intermediate.relationships = all_relationships
-        step_time = time.time() - step_start
-        self._log(f"[5] Relationship Extraction completed in {step_time:.2f}s. Relationships found: {len(all_relationships)}")
+        # === Stage 3: Relationship Extraction ===
+        self._log("[3/6] Extracting relationships...")
+        all_triples: List[UsageKnowledgeTriple] = []
 
-        # === (6) Schema Alignment ===
-        step_start = time.time()
-        # Align entities to standard types (e.g., Drug, Disease, Gene)
-        aligned_entities, prompt_tokens, completion_tokens, processing_time = self.schema_agent.align_entities(all_entities)
-        total_prompt_tokens += prompt_tokens
-        total_completion_tokens += completion_tokens
-        total_time += processing_time
-        
-        # Align relationships to standard forms
-        aligned_triples = self.schema_agent.align_relationships(all_relationships)
-        
-        self.intermediate.aligned_entities = aligned_entities
-        self.intermediate.aligned_triples = aligned_triples
-        step_time = time.time() - step_start
-        self._log(f"[6] Schema Alignment completed in {step_time:.2f}s. Entities and relationships aligned to schema.")
+        for segment in segments:
+            triples, pt, ct, _ = self.relationship_extractor.extract_relationships(segment, all_entities)
+            total_prompt_tokens += pt
+            total_completion_tokens += ct
+            all_triples.extend(triples)
 
-        # === (7) Conflict Resolution ===
-        step_start = time.time()
-        # Check new triples against existing knowledge graph for contradictions
-        non_conflicting_triples, prompt_tokens, completion_tokens, processing_time = self.conflict_agent.resolve_conflicts(
-            aligned_triples, self.knowledge_graph["triples"]
+        # Add procedure-derived triples
+        for proc in all_procedures:
+            # Procedure achieves outcome
+            if proc.outcome:
+                all_triples.append(UsageKnowledgeTriple(
+                    head=proc.name,
+                    relation=RelationType.ACHIEVES.value,
+                    tail=proc.outcome,
+                    head_type=EntityType.PROCEDURE,
+                    tail_type=EntityType.OUTCOME,
+                    confidence=0.9,
+                    software=software
+                ))
+
+            # Step relationships
+            for i, step in enumerate(proc.steps):
+                all_triples.append(UsageKnowledgeTriple(
+                    head=step,
+                    relation=RelationType.PART_OF.value,
+                    tail=proc.name,
+                    head_type=EntityType.STEP,
+                    tail_type=EntityType.PROCEDURE,
+                    step_order=i + 1,
+                    confidence=0.95,
+                    software=software
+                ))
+
+                if i > 0:
+                    all_triples.append(UsageKnowledgeTriple(
+                        head=proc.steps[i-1],
+                        relation=RelationType.NEXT_STEP.value,
+                        tail=step,
+                        head_type=EntityType.STEP,
+                        tail_type=EntityType.STEP,
+                        confidence=0.95,
+                        software=software
+                    ))
+
+        self._log(f"    Extracted {len(all_triples)} relationships")
+
+        # === Stage 4: Version Resolution ===
+        self._log("[4/6] Resolving versions...")
+        all_triples, pt, ct, _ = self.version_resolver.resolve_versions(all_triples, raw_text, version)
+        total_prompt_tokens += pt
+        total_completion_tokens += ct
+
+        # === Stage 5: Knowledge Integration ===
+        self._log("[5/6] Integrating knowledge...")
+        new_triples, flagged, pt, ct, _ = self.integrator.integrate_triples(
+            all_triples, self.knowledge_graph["triples"]
         )
-        total_prompt_tokens += prompt_tokens
-        total_completion_tokens += completion_tokens
-        total_time += processing_time
-        
-        step_time = time.time() - step_start
-        self._log(f"[7] Conflict Resolution completed in {step_time:.2f}s. Non-conflicting triples: {len(non_conflicting_triples)}/{len(aligned_triples)}")
+        total_prompt_tokens += pt
+        total_completion_tokens += ct
 
-        # === (8) Evaluation ===
-        step_start = time.time()
-        # Score and filter triples by confidence, clarity, and relevance
-        integrated_triples, prompt_tokens, completion_tokens, processing_time = self.evaluator_agent.finalize_triples(non_conflicting_triples)
-        total_prompt_tokens += prompt_tokens
-        total_completion_tokens += completion_tokens
-        total_time += processing_time
-        
-        self.intermediate.integrated_triples = integrated_triples
-        step_time = time.time() - step_start
-        self._log(f"[8] Evaluation completed in {step_time:.2f}s. Final integrated triples: {len(integrated_triples)}/{len(non_conflicting_triples)}")
+        # Add to knowledge graph
+        for entity in all_entities:
+            self.knowledge_graph["entities"][entity.entity_id] = entity
 
-        # === Integration into KG ===
-        # Add new entities to the knowledge graph
-        for entity in aligned_entities:
-            self.knowledge_graph["entities"].add(entity.name)
-            
-        # Add new triples to the knowledge graph
-        for triple in integrated_triples:
-            self.knowledge_graph["triples"].append(triple)
-            
-        # Update tracking metrics
+        for proc in all_procedures:
+            self.knowledge_graph["procedures"][proc.procedure_id] = proc
+
+        self.knowledge_graph["triples"].extend(new_triples)
+        self.intermediate.triples = new_triples
+
+        self._log(f"    Added {len(new_triples)} new triples to knowledge graph")
+
+        # === Stage 6: Summary ===
+        pipeline_time = time.time() - pipeline_start
         self.intermediate.prompt_tokens = total_prompt_tokens
         self.intermediate.completion_tokens = total_completion_tokens
-        self.intermediate.processing_time = total_time
-        
-        total_pipeline_time = time.time() - pipeline_start_time
-        self._log(f"KARMA pipeline completed in {total_pipeline_time:.2f}s. Added {len(integrated_triples)} new knowledge triples.")
-        
-        return integrated_triples
-    
-    ##########################################################################
-    # Utility Methods
-    ##########################################################################
-    def export_knowledge_graph(self, output_path: str = None) -> Dict:
-        """
-        Export the knowledge graph as a dictionary or save to a file.
-        
-        Args:
-            output_path: Optional file path to save the knowledge graph
-            
-        Returns:
-            Dictionary representation of the knowledge graph
-        """
-        # Convert the KG to a serializable format
-        kg_export = {
-            "entities": list(self.knowledge_graph["entities"]),
-            "triples": [asdict(triple) for triple in self.knowledge_graph["triples"]]
+        self.intermediate.processing_time = pipeline_time
+
+        self._log(f"[6/6] Pipeline complete in {pipeline_time:.2f}s")
+        self._log(f"    Total entities: {len(self.knowledge_graph['entities'])}")
+        self._log(f"    Total triples: {len(self.knowledge_graph['triples'])}")
+        self._log(f"    Total procedures: {len(self.knowledge_graph['procedures'])}")
+
+        return {
+            "entities": len(all_entities),
+            "procedures": len(all_procedures),
+            "triples": len(new_triples),
+            "software": software,
+            "version": version,
+            "processing_time": pipeline_time
         }
-        
-        # Save to file if path is provided
+
+    def process_update_document(self, text: str, version: str = "") -> Dict:
+        """
+        Process release notes / update document for knowledge maintenance.
+
+        Identifies changes and updates the knowledge graph accordingly.
+
+        Args:
+            text: Release notes text
+            version: Version number
+
+        Returns:
+            Dict with update results
+        """
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        pipeline_start = time.time()
+
+        self._log("[Update Pipeline] Processing release notes...")
+
+        # === Detect Changes ===
+        self._log("[1/3] Detecting changes...")
+        changes, detected_version, pt, ct, _ = self.change_detector.detect_changes(text)
+        total_prompt_tokens += pt
+        total_completion_tokens += ct
+
+        version = version or detected_version
+        if version:
+            self.knowledge_graph["versions"].add(version)
+
+        self.intermediate.changes = changes
+        self._log(f"    Detected {len(changes)} changes in version {version}")
+
+        for change in changes:
+            self._log(f"    - {change.change_type.upper()}: {change.entity_name}")
+
+        # === Analyze Impact ===
+        self._log("[2/3] Analyzing impact on existing knowledge...")
+        affected, pt, ct, _ = self.impact_analyzer.analyze_impact(
+            changes, self.knowledge_graph["triples"]
+        )
+        total_prompt_tokens += pt
+        total_completion_tokens += ct
+
+        deprecated_count = 0
+        updated_count = 0
+
+        for impact in affected:
+            idx = impact.get("triple_index", -1)
+            if 0 <= idx < len(self.knowledge_graph["triples"]):
+                triple = self.knowledge_graph["triples"][idx]
+
+                if impact.get("impact") == "deprecated":
+                    triple.status = TripleStatus.DEPRECATED
+                    triple.deprecated_version = version
+                    self.intermediate.deprecated_triples.append(triple)
+                    deprecated_count += 1
+
+                elif impact.get("impact") == "needs_update":
+                    triple.status = TripleStatus.NEEDS_REVIEW
+                    updated_count += 1
+
+        self._log(f"    Deprecated {deprecated_count} triples, flagged {updated_count} for review")
+
+        # === Add New Knowledge from Changes ===
+        self._log("[3/3] Adding new knowledge from changes...")
+        new_triples = []
+
+        for change in changes:
+            if change.change_type == "added":
+                # Create entity for new feature
+                entity = SoftwareEntity(
+                    entity_id=f"{change.entity_type.value.lower()}_{change.entity_name.lower().replace(' ', '_')}",
+                    name=change.entity_name,
+                    entity_type=change.entity_type,
+                    description=change.description,
+                    version_introduced=version,
+                    software=self.knowledge_graph["software"]
+                )
+                self.knowledge_graph["entities"][entity.entity_id] = entity
+
+                # Add "introduced_in" triple
+                new_triples.append(UsageKnowledgeTriple(
+                    head=change.entity_name,
+                    relation=RelationType.INTRODUCED_IN.value,
+                    tail=version,
+                    head_type=change.entity_type,
+                    tail_type=EntityType.VERSION,
+                    introduced_version=version,
+                    valid_version_range=f"{version}+",
+                    confidence=0.95,
+                    software=self.knowledge_graph["software"]
+                ))
+
+            elif change.change_type == "removed":
+                # Add "removed_in" triple
+                new_triples.append(UsageKnowledgeTriple(
+                    head=change.entity_name,
+                    relation=RelationType.REMOVED_IN.value,
+                    tail=version,
+                    head_type=change.entity_type,
+                    tail_type=EntityType.VERSION,
+                    confidence=0.95,
+                    software=self.knowledge_graph["software"]
+                ))
+
+                # Add replacement if specified
+                if change.new_value:
+                    new_triples.append(UsageKnowledgeTriple(
+                        head=change.entity_name,
+                        relation=RelationType.REPLACED_BY.value,
+                        tail=change.new_value,
+                        head_type=change.entity_type,
+                        tail_type=change.entity_type,
+                        confidence=0.90,
+                        software=self.knowledge_graph["software"]
+                    ))
+
+            elif change.change_type == "moved":
+                new_triples.append(UsageKnowledgeTriple(
+                    head=change.entity_name,
+                    relation=RelationType.MOVED_TO.value,
+                    tail=change.new_value,
+                    head_type=change.entity_type,
+                    tail_type=EntityType.UI_ELEMENT,
+                    introduced_version=version,
+                    confidence=0.90,
+                    software=self.knowledge_graph["software"]
+                ))
+
+                # Add new location triple
+                new_triples.append(UsageKnowledgeTriple(
+                    head=change.entity_name,
+                    relation=RelationType.LOCATED_IN.value,
+                    tail=change.new_value,
+                    head_type=change.entity_type,
+                    tail_type=EntityType.UI_ELEMENT,
+                    introduced_version=version,
+                    valid_version_range=f"{version}+",
+                    confidence=0.90,
+                    software=self.knowledge_graph["software"]
+                ))
+
+            elif change.change_type == "renamed":
+                new_triples.append(UsageKnowledgeTriple(
+                    head=change.old_value or change.entity_name,
+                    relation=RelationType.RENAMED_TO.value,
+                    tail=change.new_value,
+                    head_type=change.entity_type,
+                    tail_type=change.entity_type,
+                    introduced_version=version,
+                    confidence=0.95,
+                    software=self.knowledge_graph["software"]
+                ))
+
+        self.knowledge_graph["triples"].extend(new_triples)
+        self.intermediate.triples.extend(new_triples)
+
+        pipeline_time = time.time() - pipeline_start
+        self.intermediate.processing_time = pipeline_time
+
+        self._log(f"    Added {len(new_triples)} new triples from changes")
+        self._log(f"[Update Pipeline] Complete in {pipeline_time:.2f}s")
+
+        return {
+            "changes_detected": len(changes),
+            "triples_deprecated": deprecated_count,
+            "triples_flagged": updated_count,
+            "triples_added": len(new_triples),
+            "version": version,
+            "processing_time": pipeline_time
+        }
+
+    def get_outdated_knowledge(self) -> List[UsageKnowledgeTriple]:
+        """Get all deprecated or needs-review triples."""
+        return [
+            t for t in self.knowledge_graph["triples"]
+            if t.status in [TripleStatus.DEPRECATED, TripleStatus.NEEDS_REVIEW]
+        ]
+
+    def get_knowledge_for_version(self, version: str) -> List[UsageKnowledgeTriple]:
+        """Get all active knowledge valid for a specific version."""
+        valid_triples = []
+        for t in self.knowledge_graph["triples"]:
+            if t.status != TripleStatus.ACTIVE:
+                continue
+
+            # Check version range
+            if not t.valid_version_range or t.valid_version_range == "unknown":
+                valid_triples.append(t)
+            elif "+" in t.valid_version_range:
+                intro_ver = t.valid_version_range.replace("+", "")
+                if version >= intro_ver:
+                    valid_triples.append(t)
+            elif "-" in t.valid_version_range:
+                parts = t.valid_version_range.split("-")
+                if len(parts) == 2 and parts[0] <= version <= parts[1]:
+                    valid_triples.append(t)
+
+        return valid_triples
+
+    def export_knowledge_graph(self, output_path: str = None) -> Dict:
+        """Export knowledge graph to JSON."""
+        kg_export = {
+            "software": self.knowledge_graph["software"],
+            "versions": list(self.knowledge_graph["versions"]),
+            "entities": [asdict(e) for e in self.knowledge_graph["entities"].values()],
+            "procedures": [asdict(p) for p in self.knowledge_graph["procedures"].values()],
+            "triples": [t.to_dict() for t in self.knowledge_graph["triples"]],
+            "statistics": {
+                "total_entities": len(self.knowledge_graph["entities"]),
+                "total_procedures": len(self.knowledge_graph["procedures"]),
+                "total_triples": len(self.knowledge_graph["triples"]),
+                "active_triples": len([t for t in self.knowledge_graph["triples"] if t.status == TripleStatus.ACTIVE]),
+                "deprecated_triples": len([t for t in self.knowledge_graph["triples"] if t.status == TripleStatus.DEPRECATED])
+            }
+        }
+
         if output_path:
             with open(output_path, 'w') as f:
-                json.dump(kg_export, f, indent=2)
-                
+                json.dump(kg_export, f, indent=2, default=str)
+            logger.info(f"Knowledge graph exported to {output_path}")
+
         return kg_export
-    
+
     def save_intermediate_results(self, output_path: str):
-        """
-        Save all intermediate results from the pipeline for analysis.
-        
-        Args:
-            output_path: Path to save the results
-        """
+        """Save intermediate pipeline results."""
         try:
             with open(output_path, 'w') as f:
-                json.dump(self.intermediate.to_dict(), f, indent=2)
+                json.dump(self.intermediate.to_dict(), f, indent=2, default=str)
             logger.info(f"Intermediate results saved to {output_path}")
         except Exception as e:
             logger.error(f"Failed to save intermediate results: {str(e)}")
-    
-    def clear_knowledge_graph(self):
-        """Reset the knowledge graph to empty state."""
-        self.knowledge_graph = {
-            "entities": set(),
-            "triples": []
-        }
-        logger.info("Knowledge graph cleared")
 
     def print_statistics(self):
-        """Print statistics about the current knowledge graph."""
-        entity_count = len(self.knowledge_graph["entities"])
-        triple_count = len(self.knowledge_graph["triples"])
-        
-        # Calculate types distribution
-        entity_types = {}
-        relation_types = {}
-        
-        for triple in self.knowledge_graph["triples"]:
-            relation_types[triple.relation] = relation_types.get(triple.relation, 0) + 1
-        
-        # Print summary
-        print(f"Knowledge Graph Statistics:")
-        print(f"  - Entities: {entity_count}")
-        print(f"  - Relationships: {triple_count}")
-        print(f"  - Unique relation types: {len(relation_types)}")
-        
-        if relation_types:
-            print("\nTop relation types:")
-            for rel, count in sorted(relation_types.items(), key=lambda x: x[1], reverse=True)[:5]:
-                print(f"  - {rel}: {count}")
+        """Print knowledge graph statistics."""
+        print(f"\nKnowledge Graph Statistics for {self.knowledge_graph['software']}:")
+        print(f"  Versions tracked: {sorted(self.knowledge_graph['versions'])}")
+        print(f"  Total entities: {len(self.knowledge_graph['entities'])}")
+        print(f"  Total procedures: {len(self.knowledge_graph['procedures'])}")
+        print(f"  Total triples: {len(self.knowledge_graph['triples'])}")
+
+        # Count by status
+        status_counts = {}
+        for t in self.knowledge_graph["triples"]:
+            status = t.status.value if isinstance(t.status, TripleStatus) else t.status
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        print(f"\n  Triples by status:")
+        for status, count in sorted(status_counts.items()):
+            print(f"    - {status}: {count}")
+
+        # Count by relation type
+        relation_counts = {}
+        for t in self.knowledge_graph["triples"]:
+            relation_counts[t.relation] = relation_counts.get(t.relation, 0) + 1
+
+        print(f"\n  Top relationship types:")
+        for rel, count in sorted(relation_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"    - {rel}: {count}")
+
 
 ##############################################################################
-# Example Usage
+# CLI Entry Point
 ##############################################################################
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Run KARMA pipeline on a document')
-    parser.add_argument('--input', required=True, help='Path to input PDF or text file')
-    parser.add_argument('--api_key', required=True, help='API key')
+
+    parser = argparse.ArgumentParser(
+        description='KARMA: Extract software usage knowledge from documentation'
+    )
+    parser.add_argument('--input', required=True, help='Path to input document (PDF or text)')
+    parser.add_argument('--api_key', required=True, help='OpenAI API key')
     parser.add_argument('--base_url', default=None, help='Optional API base URL')
-    parser.add_argument('--model', default='deepseek-chat', help='model name')
-    parser.add_argument('--output', default='karma_output.json', help='Output file path')
-    
+    parser.add_argument('--model', default='gpt-4o', help='Model name')
+    parser.add_argument('--output', default='karma_knowledge_graph.json', help='Output file path')
+    parser.add_argument('--update', action='store_true', help='Process as update/release notes')
+
     args = parser.parse_args()
-    
+
     # Initialize KARMA
     karma = KARMA(api_key=args.api_key, base_url=args.base_url, model_name=args.model)
-    
-    # Process document
-    print(f"Processing document: {args.input}")
-    triples = karma.process_document(args.input)
-    
+
+    # Read input
+    if args.input.lower().endswith('.pdf'):
+        print(f"Processing PDF: {args.input}")
+        result = karma.process_document(args.input)
+    else:
+        with open(args.input, 'r') as f:
+            text = f.read()
+
+        if args.update:
+            print(f"Processing as update document: {args.input}")
+            result = karma.process_update_document(text)
+        else:
+            print(f"Processing document: {args.input}")
+            result = karma.process_document(text)
+
     # Export results
     karma.export_knowledge_graph(args.output)
     karma.save_intermediate_results(f"intermediate_{args.output}")
-    
-    print(f"\nExtracted {len(triples)} knowledge triples.")
-    print(f"Results saved to {args.output}")
+    karma.print_statistics()
+
+    print(f"\nResults saved to {args.output}")
