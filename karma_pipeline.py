@@ -391,18 +391,15 @@ Return only valid JSON, no other text."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             # Parse JSON response
@@ -529,18 +526,15 @@ Return only valid JSON."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             entities = []
@@ -659,18 +653,15 @@ Return only valid JSON."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             entities = []
@@ -812,18 +803,15 @@ Return only valid JSON. Return empty array if no clear procedures are found."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             procedures = []
@@ -964,18 +952,15 @@ Return only valid JSON."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             triples = []
@@ -1116,18 +1101,15 @@ Return only valid JSON."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             try:
@@ -1247,18 +1229,15 @@ Return only valid JSON."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             changes = []
@@ -1393,18 +1372,15 @@ Return only valid JSON."""
 
         start_time = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1
+                instructions=self.system_prompt,
+                input=prompt
             )
 
-            content = response.choices[0].message.content.strip()
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
+            content = response.output_text.strip()
+            prompt_tokens = response.usage.input_tokens if response.usage else 0
+            completion_tokens = response.usage.output_tokens if response.usage else 0
             processing_time = time.time() - start_time
 
             affected = []
@@ -1521,7 +1497,7 @@ class KARMA:
     - Deprecation and Update
     """
 
-    def __init__(self, api_key: str, base_url: str = None, model_name: str = "gpt-4o"):
+    def __init__(self, api_key: str, base_url: str = None, model_name: str = "gpt-5.2"):
         """
         Initialize KARMA pipeline.
 
@@ -2056,7 +2032,7 @@ if __name__ == "__main__":
     parser.add_argument('--input', required=True, help='Path to input document (PDF or text)')
     parser.add_argument('--api_key', required=True, help='OpenAI API key')
     parser.add_argument('--base_url', default=None, help='Optional API base URL')
-    parser.add_argument('--model', default='gpt-4o', help='Model name')
+    parser.add_argument('--model', default='gpt-5.2', help='Model name')
     parser.add_argument('--output', default='karma_knowledge_graph.json', help='Output file path')
     parser.add_argument('--update', action='store_true', help='Process as update/release notes')
 
