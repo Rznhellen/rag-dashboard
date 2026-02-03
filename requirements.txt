@@ -1,0 +1,7 @@
+# KARMA Pipeline Dependencies
+openai>=1.0.0
+pypdf2>=3.0.0
+python-dotenv>=1.0.0
+
+# Storage and Visualization (optional)
+# No additional dependencies required - uses standard library
