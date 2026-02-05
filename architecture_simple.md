@@ -84,7 +84,7 @@ OUTPUT (Knowledge Graph)
 ```
 You are extracting knowledge from software documentation.
 
-Extract all important entities (things) mentioned in this text.
+Extract all important entities (things) mentioned in this file.
 
 For each entity, identify:
 - name: The entity's name
@@ -93,9 +93,6 @@ For each entity, identify:
   - UIElement: A button, menu, panel, or tool (e.g., "Save button", "Layers panel")
   - Concept: A term users need to understand (e.g., "Layer", "Resolution")
 - description: Brief description (1 sentence)
-
-Text:
-{{input_text}}
 
 Return ONLY a JSON object in this exact format:
 {
